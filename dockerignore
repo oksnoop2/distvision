@@ -1,0 +1,15 @@
+PV/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env/
+venv/
+.venv/
+.git/
+*.log
+*.tmp
+*.temp
+.DS_Store
+combined_output.txt
+dockerignore
