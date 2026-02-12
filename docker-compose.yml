@@ -108,7 +108,7 @@ services:
       - IMAGE_DIR=/app/images
       - BACKGROUND_INTERVAL=30  # More frequent updates
       # Thingino RTSP Configuration
-      - RTSP_URLS=rtsp://thingino:thingino@192.168.1.11/ch1,rtsp://thingino:thingino@192.168.1.11/ch0
+      - RTSP_URLS=rtsp://thingino:thingino@192.168.1.11/ch0
       - RTSP_CROP_TOP=55  # Based on your GIMP measurement
       - RTSP_THROWAWAY_FRAMES=5
       - RTSP_TIMEOUT_MS=10000
@@ -156,4 +156,5 @@ services:
       - REDIS_HOST=redis-service
       - CHROMA_HOST=chroma-service
       - LLM_URL=http://embed-model:8084/v1
+      - IMAGE_SERVER_URL=http://image-server:8000
     depends_on: [redis-service, chroma-service, embed-model]

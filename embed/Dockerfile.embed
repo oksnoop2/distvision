@@ -1,7 +1,15 @@
 FROM python:3.11-slim-bookworm
+
 WORKDIR /app
+
+# Copy only the dependency file first to leverage Docker cache
 COPY requirements.txt .
+
+# Install Python packages – no build tools, no extra system packages
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
+
+# Copy the embed worker
 COPY embed.py .
+
 CMD ["python", "embed.py"]

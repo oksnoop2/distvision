@@ -80,11 +80,11 @@ async def capture_image(filename_prefix):
                 continue
 
             # Apply OSD cropping (55 pixels from top as measured)
-            if frame is not None and RTSP_CROP_TOP > 0:
-                height = frame.shape[0]
-                if height > RTSP_CROP_TOP:
-                    frame = frame[RTSP_CROP_TOP:, :]
-                    print(f"[{NODE_NAME}] Cropped {RTSP_CROP_TOP}px OSD from top ({height} → {frame.shape[0]}px)")
+           # if frame is not None and RTSP_CROP_TOP > 0:
+            #    height = frame.shape[0]
+             #   if height > RTSP_CROP_TOP:
+              #      frame = frame[RTSP_CROP_TOP:, :]
+               #     print(f"[{NODE_NAME}] Cropped {RTSP_CROP_TOP}px OSD from top ({height} → {frame.shape[0]}px)")
 
             # Save the cropped frame
             if frame is not None and frame.size > 0:
@@ -92,7 +92,7 @@ async def capture_image(filename_prefix):
                 filename = f"{filename_prefix}_{NODE_NAME}_{timestamp}.jpg"
                 filepath = os.path.join(IMAGE_DIR, filename)
 
-                cv2.imwrite(filepath, frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                cv2.imwrite(filepath, frame, [cv2.IMWRITE_JPEG_QUALITY, 100])
                 print(f"[{NODE_NAME}] Saved {filepath} (Size: {frame.shape[1]}x{frame.shape[0]})")
                 return filepath
 
@@ -124,7 +124,7 @@ async def capture_webcam_image(filename_prefix):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{filename_prefix}_{NODE_NAME}_{timestamp}.jpg"
         filepath = os.path.join(IMAGE_DIR, filename)
-        cv2.imwrite(filepath, frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        cv2.imwrite(filepath, frame, [cv2.IMWRITE_JPEG_QUALITY, 100])
         print(f"[{NODE_NAME}] Saved webcam image: {filepath}")
         return filepath
 
