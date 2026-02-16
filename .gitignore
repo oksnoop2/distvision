@@ -217,3 +217,5 @@ runs/
 PV/
 PV/
 PV/
+*.kate-swp
+all_code.txt
