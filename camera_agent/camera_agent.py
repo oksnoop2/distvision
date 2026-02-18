@@ -17,7 +17,7 @@ BACKGROUND_INTERVAL = int(os.getenv("BACKGROUND_INTERVAL", "60"))
 
 # Thingino RTSP Configuration
 RTSP_URLS = os.getenv("RTSP_URLS", "rtsp://thingino:thingino@192.168.1.11/ch1,rtsp://thingino:thingino@192.168.1.11/ch0").split(",")
-RTSP_CROP_TOP = int(os.getenv("RTSP_CROP_TOP", "55"))  # Based on your GIMP measurement
+RTSP_CROP_TOP = int(os.getenv("RTSP_CROP_TOP", "55"))
 RTSP_THROWAWAY_FRAMES = int(os.getenv("RTSP_THROWAWAY_FRAMES", "5"))
 RTSP_TIMEOUT_MS = int(os.getenv("RTSP_TIMEOUT_MS", "10000"))
 ENABLE_WEBCAM_FALLBACK = os.getenv("ENABLE_WEBCAM_FALLBACK", "true").lower() == "true"
@@ -25,14 +25,13 @@ ENABLE_WEBCAM_FALLBACK = os.getenv("ENABLE_WEBCAM_FALLBACK", "true").lower() == 
 # Streams
 CAMERA_REQUEST_STREAM = "stream:camera:requests"
 VISION_SMALL_STREAM = "stream:vision:small:input"
-VISION_LARGE_STREAM = "stream:vision:large:input"
 CAMERA_CONSUMER_GROUP = "camera:agents"
 CAMERA_CONSUMER_NAME = f"camera:{NODE_NAME}"
 
 r = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True)
 
 async def capture_image(filename_prefix):
-    """Capture image from Thingino RTSP stream with OSD cropping, fallback to webcam"""
+
 
     # Try each RTSP URL in order
     for rtsp_url in RTSP_URLS:
@@ -79,14 +78,7 @@ async def capture_image(filename_prefix):
                 print(f"[{NODE_NAME}] Failed to read frame from RTSP: {rtsp_url}")
                 continue
 
-            # Apply OSD cropping (55 pixels from top as measured)
-           # if frame is not None and RTSP_CROP_TOP > 0:
-            #    height = frame.shape[0]
-             #   if height > RTSP_CROP_TOP:
-              #      frame = frame[RTSP_CROP_TOP:, :]
-               #     print(f"[{NODE_NAME}] Cropped {RTSP_CROP_TOP}px OSD from top ({height} → {frame.shape[0]}px)")
 
-            # Save the cropped frame
             if frame is not None and frame.size > 0:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 filename = f"{filename_prefix}_{NODE_NAME}_{timestamp}.jpg"
@@ -143,7 +135,6 @@ async def ensure_consumer_group(stream_name, group_name):
 async def background_loop():
     print(f"[{NODE_NAME}] Starting background loop ({BACKGROUND_INTERVAL}s)")
     print(f"[{NODE_NAME}] RTSP URLs: {RTSP_URLS}")
-    print(f"[{NODE_NAME}] OSD crop: {RTSP_CROP_TOP}px from top")
     print(f"[{NODE_NAME}] Webcam fallback: {ENABLE_WEBCAM_FALLBACK}")
 
     while True:
@@ -151,11 +142,9 @@ async def background_loop():
         if filepath:
             msg = {
                 "id": str(uuid.uuid4()),
-                "prompt": "Describe the environment in detail.",
                 "filepath": filepath,
-                "type": "background_indexing",
                 "timestamp": datetime.now().isoformat(),
-                "camera_node": NODE_NAME
+                "camera_node": NODE_NAME          # optional – keep for debugging, or remove
             }
             await r.xadd(VISION_SMALL_STREAM, {"data": json.dumps(msg)}, maxlen=1000)
             print(f"[{NODE_NAME}] → Sent to {VISION_SMALL_STREAM}")
@@ -173,26 +162,31 @@ async def request_listener():
                 streams={CAMERA_REQUEST_STREAM: ">"},
                 count=1, block=2000
             )
-            if not messages: continue
+            if not messages:
+                continue
 
             mid, mdata = messages[0][1][0]
             data = json.loads(mdata["data"])
-            req_id = data.get("req_id")
-            prompt = data.get("prompt")
+            request_id = data.get("id")
+            prompt = data.get("prompt", "")
+            original_timestamp = data.get("timestamp")  # preserve original timestamp
 
-            print(f"[{NODE_NAME}] Handling Request {req_id}")
-            filepath = await capture_image(f"req_{req_id}")
+            print(f"[{NODE_NAME}] Handling Request {request_id}")
+            filepath = await capture_image(f"req_{request_id}")
+
+            # Always forward the request, even if capture failed
+            resp = {
+                "id": request_id,
+                "prompt": prompt or "",   # ensure it's a string
+                "timestamp": original_timestamp,
+            }
 
             if filepath:
-                resp = {
-                    "req_id": req_id,
-                    "filepath": filepath,
-                    "prompt": prompt,
-                    "status": "image_ready",
-                    "timestamp": datetime.now().isoformat()
-                }
-                await r.xadd(VISION_LARGE_STREAM, {"data": json.dumps(resp)}, maxlen=1000)
-                print(f"[{NODE_NAME}] → Sent to {VISION_LARGE_STREAM}")
+                resp["filepath"] = filepath
+
+            # Send to vision_small (next step in linear pipeline)
+            await r.xadd(VISION_SMALL_STREAM, {"data": json.dumps(resp)}, maxlen=1000)
+            print(f"[{NODE_NAME}] → Sent to {VISION_SMALL_STREAM}" + (" (with image)" if filepath else " (text only)"))
 
             await r.xack(CAMERA_REQUEST_STREAM, CAMERA_CONSUMER_GROUP, mid)
         except Exception as e:

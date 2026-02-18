@@ -1,6 +1,7 @@
 import json
 import asyncio
 import uuid
+from datetime import datetime, timezone
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 import redis.asyncio as redis
@@ -9,7 +10,8 @@ from redis.exceptions import ResponseError
 app = FastAPI()
 r = redis.Redis(host="redis-service", port=6379, decode_responses=True)
 
-INTERFACE_INPUT_STREAM = "stream:interface:input"
+# Changed: Interface now sends to camera stream as first step of linear pipeline
+CAMERA_REQUEST_STREAM = "stream:camera:requests"
 INTERFACE_OUTPUT_STREAM = "stream:interface:output"
 CONSUMER_GROUP = "interface_broadcast"
 CONSUMER_NAME = "interface_worker"
@@ -41,7 +43,8 @@ html = """
             ws.onmessage = function(e) {
                 console.log("WS IN:", e.data);
                 var d = JSON.parse(e.data);
-                if (d.type === 'response' && d.content) {
+                // Display any message that has content
+                if (d.content) {
                     document.getElementById("chat").innerHTML +=
                         "<div class='msg'>🤖 " + d.content + "</div>";
                 }
@@ -128,7 +131,6 @@ async def redis_listener():
                     continue
 
                 await manager.broadcast({
-                    "type": "response",
                     "id": raw.get("id"),
                     "content": content,
                     "timestamp": raw.get("timestamp")
@@ -155,12 +157,14 @@ async def ws_endpoint(websocket: WebSocket):
     try:
         while True:
             data = await websocket.receive_text()
-            req_id = str(uuid.uuid4())[:8]
+            req_id = str(uuid.uuid4())
+            timestamp = datetime.now(timezone.utc).isoformat()
             payload = {
                 "id": req_id,
                 "prompt": data,
-                "timestamp": asyncio.get_event_loop().time()
+                "timestamp": timestamp
             }
-            await r.xadd(INTERFACE_INPUT_STREAM, {"data": json.dumps(payload)})
+            # Publish to camera request stream (first step in pipeline)
+            await r.xadd(CAMERA_REQUEST_STREAM, {"data": json.dumps(payload)})
     except WebSocketDisconnect:
         manager.disconnect(websocket)

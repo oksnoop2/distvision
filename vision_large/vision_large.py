@@ -17,7 +17,6 @@ CONSUMER_NAME = "worker"
 r = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True)
 client = OpenAI(base_url=LLM_URL, api_key="sk-no-key")
 
-
 async def main():
     try:
         await r.xgroup_create(INPUT_STREAM, CONSUMER_GROUP, id="0", mkstream=True)
@@ -44,10 +43,17 @@ async def main():
 
             print("VL INPUT:", data)
 
+            # Extract fields (all services now use "id")
+            request_id = data.get("id")
             filepath = data.get("filepath")
             prompt = data.get("prompt")
             context = data.get("context_text", "")
             timestamp = data.get("timestamp")
+
+            if not request_id or not prompt:
+                print(f"⚠️ Missing id or prompt in message: {data}")
+                await r.xack(INPUT_STREAM, CONSUMER_GROUP, mid)
+                continue
 
             messages_payload = []
 
@@ -77,39 +83,36 @@ async def main():
                 print(f"Processing Text Query: {prompt}")
                 messages_payload.append({
                     "role": "user",
-                    "content": prompt  # ← Should be a string, not a list!
+                    "content": prompt  # simple string for text-only
                 })
 
             resp = await asyncio.to_thread(
                 client.chat.completions.create,
                 model="Qwen3-VL",
                 messages=messages_payload,
-                max_tokens=300,
+                max_tokens=1024,
                 temperature=1.0,
                 top_p=0.95,
                 presence_penalty=0.0,
-                #top_k=20,
                 stream=False
             )
 
             answer = resp.choices[0].message.content
 
             out = {
-                "id": data.get("req_id"),
+                "id": request_id,                # use consistent "id"
                 "response": answer,
                 "timestamp": timestamp,
-                "type": "response"
             }
 
             await r.xadd(OUTPUT_STREAM, {"data": json.dumps(out)})
-            print("→ Interface")
+            print(f"→ Interface (id: {request_id})")
 
             await r.xack(INPUT_STREAM, CONSUMER_GROUP, mid)
 
         except Exception as e:
             print(f"Vision Large Error: {e}")
             await asyncio.sleep(1)
-
 
 if __name__ == "__main__":
     asyncio.run(main())

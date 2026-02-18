@@ -1,10 +1,14 @@
-redis>=4.5.0
-openai>=1.0.0
-chromadb>=0.4.18
-opencv-python-headless>=4.8.0
-fastapi>=0.104.0
-uvicorn>=0.24.0
-websockets>=12.0
-jinja2>=3.1.0
-python-multipart>=0.0.6
-numpy>=1.24.0
+redis>=4.6.0,<6.0.0
+openai>=1.0.0,<2.0.0
+chromadb>=0.4.18,<0.6.0
+opencv-python-headless>=4.8.0,<5.0.0
+fastapi>=0.104.0,<1.0.0
+uvicorn[standard]>=0.24.0,<1.0.0
+websockets>=12.0,<14.0
+jinja2>=3.1.0,<4.0.0
+python-multipart>=0.0.6,<1.0.0
+numpy>=1.24.0,<2.0.0
+
+# Required for image resizing in vision_small
+Pillow>=10.0.0,<12.0.0
+requests>=2.31.0,<3.0.0

@@ -21,22 +21,7 @@ services:
       - ./PV/Images:/images:ro
     ports: ["8090:8000"]
 
-  router-model:
-    image: ghcr.io/ggml-org/llama.cpp:server
-    volumes:
-      - ./PV/GGUF:/models:ro
-    ports: ["8081:8081"]
-    command: >
-      -m /models/Qwen3-VL-2B-Instruct-Q4_K_M.gguf
-      --host 0.0.0.0
-      --port 8081
-      -c 1024
-      --chat-template-file /models/qwen3_fixed_template.jinja
-      --jinja
-      --temp 1.0
-      --top-p 0.95
-      --presence-penalty 0.0
-      --threads 6
+
 
   vision-small-model:
     image: ghcr.io/ggml-org/llama.cpp:server
@@ -49,6 +34,7 @@ services:
       --host 0.0.0.0
       --port 8082
       -c 4096
+      --cache-ram 0
       --chat-template-file /models/qwen3_fixed_template.jinja
       --jinja
       --temp 0.7
@@ -109,21 +95,12 @@ services:
       - BACKGROUND_INTERVAL=30  # More frequent updates
       # Thingino RTSP Configuration
       - RTSP_URLS=rtsp://thingino:thingino@192.168.1.11/ch0
-      - RTSP_CROP_TOP=55  # Based on your GIMP measurement
       - RTSP_THROWAWAY_FRAMES=5
       - RTSP_TIMEOUT_MS=10000
       - ENABLE_WEBCAM_FALLBACK=true
     depends_on: [redis-service]
 
-  route:
-    build:
-      context: ./route
-      dockerfile: Dockerfile.route
-    environment:
-      - PYTHONUNBUFFERED=1
-      - REDIS_HOST=redis-service
-      - LLM_URL=http://router-model:8081/v1
-    depends_on: [redis-service, router-model]
+
 
   vision_small:
     build:
