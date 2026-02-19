@@ -24,7 +24,7 @@ ENABLE_WEBCAM_FALLBACK = os.getenv("ENABLE_WEBCAM_FALLBACK", "true").lower() == 
 
 # Streams
 CAMERA_REQUEST_STREAM = "stream:camera:requests"
-VISION_SMALL_STREAM = "stream:vision:small:input"
+EMBED_STREAM = "stream:embed:input"
 CAMERA_CONSUMER_GROUP = "camera:agents"
 CAMERA_CONSUMER_NAME = f"camera:{NODE_NAME}"
 
@@ -146,8 +146,8 @@ async def background_loop():
                 "timestamp": datetime.now().isoformat(),
                 "camera_node": NODE_NAME          # optional – keep for debugging, or remove
             }
-            await r.xadd(VISION_SMALL_STREAM, {"data": json.dumps(msg)}, maxlen=1000)
-            print(f"[{NODE_NAME}] → Sent to {VISION_SMALL_STREAM}")
+            await r.xadd(EMBED_STREAM, {"data": json.dumps(msg)}, maxlen=1000)
+            print(f"[{NODE_NAME}] → Sent to {EMBED_STREAM}")
         await asyncio.sleep(BACKGROUND_INTERVAL)
 
 async def request_listener():
@@ -185,8 +185,8 @@ async def request_listener():
                 resp["filepath"] = filepath
 
             # Send to vision_small (next step in linear pipeline)
-            await r.xadd(VISION_SMALL_STREAM, {"data": json.dumps(resp)}, maxlen=1000)
-            print(f"[{NODE_NAME}] → Sent to {VISION_SMALL_STREAM}" + (" (with image)" if filepath else " (text only)"))
+            await r.xadd(EMBED_STREAM, {"data": json.dumps(resp)}, maxlen=1000)
+            print(f"[{NODE_NAME}] → Sent to {EMBED_STREAM}" + (" (with image)" if filepath else " (text only)"))
 
             await r.xack(CAMERA_REQUEST_STREAM, CAMERA_CONSUMER_GROUP, mid)
         except Exception as e:

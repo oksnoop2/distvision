@@ -1,48 +1,128 @@
 import json
 import asyncio
 import os
+import base64
 import uuid
+from datetime import datetime
+import httpx
 import redis.asyncio as redis
 from redis.exceptions import ResponseError
 import chromadb
-from openai import OpenAI
 
 # ---------- Environment ----------
 REDIS_HOST = os.getenv("REDIS_HOST", "redis-service")
 CHROMA_HOST = os.getenv("CHROMA_HOST", "chroma-service")
-LLM_URL = os.getenv("LLM_URL", "http://embed-model:8084/v1")
+EMBED_URL = os.getenv("EMBED_LLM_URL", "http://embed-model:8085")
+print(f"Using EMBED_URL: {EMBED_URL}")
+IMAGE_SERVER_URL = os.getenv("IMAGE_SERVER_URL", "http://image-server:8000")
 
-# ---------- Streams & Constants ----------
+# ---------- Streams ----------
 INPUT_STREAM = "stream:embed:input"
 OUTPUT_STREAM = "stream:vision:large:input"
 CONSUMER_GROUP = "embed_worker"
 CONSUMER_NAME = "worker_1"
-CHROMA_COLLECTION = "visual_memory"
+
+CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", "visual_memory_images")
 RETRIEVAL_COUNT = 10
+EXPECTED_DIM = 2048  # Qwen3-VL-Embedding dimension
 
 # ---------- Clients ----------
 r = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True)
-client = OpenAI(base_url=LLM_URL, api_key="sk-no-key")
+chroma_client = None
+collection = None
 
-def get_vec(text: str, query: bool = False):
-    prefix = "search_query: " if query else "search_document: "
-    resp = client.embeddings.create(
-        input=[prefix + text],
-        model="nomic"
+async def init_chroma():
+    global chroma_client, collection
+    print(f"Connecting to ChromaDB at {CHROMA_HOST}...")
+    chroma_client = await chromadb.AsyncHttpClient(host=CHROMA_HOST, port=8000)
+    collection = await chroma_client.get_or_create_collection(
+        name=CHROMA_COLLECTION,
+        metadata={"hnsw:space": "cosine"}
     )
-    return resp.data[0].embedding
+    print(f"Chroma collection '{CHROMA_COLLECTION}' ready.")
+
+async def get_image_embedding(image_url: str, text: str = None) -> list[float]:
+    # Download image
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(image_url, timeout=10)
+        resp.raise_for_status()
+        img_base64 = base64.b64encode(resp.content).decode("utf-8")
+
+    # Build prompt
+    if text:
+        prompt = f"<image>\nRepresent this image and text for retrieval: {text}"
+    else:
+        prompt = "<image>\nRepresent this image."
+
+    # Call embedding server
+    async with httpx.AsyncClient() as client:
+        payload = {
+            "content": prompt,
+            "image_data": [{"data": img_base64, "id": 0}]
+        }
+        try:
+            resp = await client.post(f"{EMBED_URL}/embedding", json=payload, timeout=30)
+            resp.raise_for_status()
+            data = resp.json()
+
+            # ---- Extract embedding ----
+            embedding = None
+
+            # Case 1: list of results (most common)
+            if isinstance(data, list) and len(data) > 0:
+                first = data[0]
+                if isinstance(first, dict) and "embedding" in first:
+                    embedding = first["embedding"]
+                elif isinstance(first, list):
+                    embedding = first
+                else:
+                    # Fallback: maybe the whole list is the embedding (if length matches)
+                    if len(data) == EXPECTED_DIM:
+                        embedding = data
+                    else:
+                        raise ValueError(f"Unexpected list format: {type(first)}")
+
+            # Case 2: direct dict with embedding
+            elif isinstance(data, dict) and "embedding" in data:
+                embedding = data["embedding"]
+
+            if embedding is None:
+                raise ValueError(f"Could not extract embedding from response: {data}")
+
+            # Ensure it's a flat list of floats
+            if not isinstance(embedding, list):
+                raise ValueError(f"Embedding is not a list: {type(embedding)}")
+
+            # Check if the list contains nested lists (unlikely, but flatten if needed)
+            if embedding and isinstance(embedding[0], list):
+                # Flatten one level (should not happen, but just in case)
+                embedding = [item for sublist in embedding for item in sublist]
+
+            # Verify dimension
+            if len(embedding) != EXPECTED_DIM:
+                print(f"⚠️ Warning: embedding dimension is {len(embedding)}, expected {EXPECTED_DIM}")
+
+            # Optional: print first few values for debugging
+            #print(f"Embedding first 5 values: {embedding[:5]}")
+
+            return embedding
+
+        except Exception as e:
+            print(f"Error getting embedding: {e}")
+            if 'resp' in locals():
+                print(f"Response text: {resp.text}")
+            raise
 
 async def main():
+    await init_chroma()
+
     try:
         await r.xgroup_create(INPUT_STREAM, CONSUMER_GROUP, id="0", mkstream=True)
     except ResponseError as e:
         if "BUSYGROUP" not in str(e):
             raise e
 
-    print(f"Connecting to ChromaDB at {CHROMA_HOST}...")
-    chroma_client = await chromadb.AsyncHttpClient(host=CHROMA_HOST, port=8000)
-    collection = await chroma_client.get_or_create_collection(name=CHROMA_COLLECTION)
-    print("Embed listening...")
+    print("Embed (Qwen) listening...")
 
     while True:
         try:
@@ -60,71 +140,66 @@ async def main():
             data = json.loads(mdata["data"])
 
             request_id = data.get("id")
-            prompt = data.get("prompt")           # may be None for background
-            description = data.get("description") # always present when image was processed
+            prompt = data.get("prompt")
             filepath = data.get("filepath")
             timestamp = data.get("timestamp")
 
-            # Only require ID; prompt can be absent
-            if not request_id:
-                print(f"⚠️ Missing id in message: {data}")
+            if not request_id or not filepath:
+                print(f"Missing id or filepath in message: {data}")
                 await r.xack(INPUT_STREAM, CONSUMER_GROUP, mid)
                 continue
 
-            # ---------- 1. Always index the description if it exists ----------
-            if description:
-                vec = await asyncio.to_thread(get_vec, description, False)
-                memory_id = f"{timestamp}_{uuid.uuid4().hex[:8]}"
-                await collection.add(
-                    ids=[memory_id],
-                    embeddings=[vec],
-                    documents=[description],
-                    metadatas=[{
-                        "timestamp": timestamp,
-                        "filepath": filepath
-                    }]
-                )
-                print(f"Indexed memory {memory_id}")
+            filename = os.path.basename(filepath)
+            image_url = f"{IMAGE_SERVER_URL}/{filename}"
 
-            # ---------- 2. Only do retrieval & answer for user requests (prompt exists) ----------
+            # Get embedding
+            embedding = await get_image_embedding(image_url, text=prompt if prompt else None)
+
+            # Store in ChromaDB
+            memory_id = f"{timestamp}_{uuid.uuid4().hex[:8]}"
+            metadata = {
+                "timestamp": timestamp,
+                "filepath": filepath,
+                "has_prompt": bool(prompt)
+            }
+            await collection.add(
+                ids=[memory_id],
+                embeddings=[embedding],
+                metadatas=[metadata],
+                documents=[prompt] if prompt else None
+            )
+            print(f"Indexed image {memory_id}")
+
+            # If user request, retrieve and forward
             if prompt:
-                # Use description if available, otherwise fallback to prompt for query embedding
-                query_text = description if description else prompt
-                vec_query = await asyncio.to_thread(get_vec, query_text, True)
+                query_embedding = embedding
                 results = await collection.query(
-                    query_embeddings=[vec_query],
-                    n_results=RETRIEVAL_COUNT
+                    query_embeddings=[query_embedding],
+                    n_results=RETRIEVAL_COUNT,
+                    where={"timestamp": {"$ne": timestamp}} if timestamp else None
                 )
 
+                past_image_urls = []
                 metadatas = results.get("metadatas", [[]])[0]
-                documents = results.get("documents", [[]])[0]
+                for meta in metadatas:
+                    past_path = meta.get("filepath")
+                    if past_path:
+                        past_filename = os.path.basename(past_path)
+                        past_image_urls.append(f"{IMAGE_SERVER_URL}/{past_filename}")
 
-                context_parts = []
-                if description:
-                    context_parts.append(f"[CURRENT] {description}")
-
-                for idx, (meta, doc) in enumerate(zip(metadatas, documents), start=1):
-                    ts = meta.get("timestamp", "unknown")
-                    context_parts.append(f"[{idx}] {ts}: {doc}")
-
-                full_context = "\n".join(context_parts) if context_parts else "(No context available)"
-
-                msg = {
+                out = {
                     "id": request_id,
                     "prompt": prompt,
-                    "full_context": full_context,
+                    "current_image_url": image_url,
+                    "past_image_urls": past_image_urls,
                     "timestamp": timestamp
                 }
-                if filepath:
-                    msg["filepath"] = filepath
 
-                await r.xadd(OUTPUT_STREAM, {"data": json.dumps(msg)})
-                print(f"→ Vision Large (id: {request_id})")
+                await r.xadd(OUTPUT_STREAM, {"data": json.dumps(out)})
+                print(f"→ Vision Large (id: {request_id}) with {len(past_image_urls)} past images")
             else:
-                # Background capture: indexed but no answer needed
-                print(f"Background capture indexed (id: {request_id}) – skipping vision_large")
+                print(f"Background capture indexed (id: {request_id})")
 
-            # ---------- Acknowledge ----------
             await r.xack(INPUT_STREAM, CONSUMER_GROUP, mid)
 
         except Exception as e:
