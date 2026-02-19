@@ -4,6 +4,10 @@ import os
 import redis.asyncio as redis
 from redis.exceptions import ResponseError
 from openai import OpenAI
+import cv2
+import numpy as np
+import base64
+import httpx
 
 REDIS_HOST = os.getenv("REDIS_HOST", "redis-service")
 LLM_URL = os.getenv("LLM_URL", "http://vision-large-model:8083/v1")
@@ -43,9 +47,7 @@ async def main():
 
             print("VL INPUT:", data)
 
-            # Extract fields (all services now use "id")
             request_id = data.get("id")
-            filepath = data.get("filepath")
             prompt = data.get("prompt")
             context = data.get("context_text", "")
             timestamp = data.get("timestamp")
@@ -68,23 +70,53 @@ async def main():
                     "content": "You are a helpful AI assistant. Respond in English only. Keep your responses concise."
                 })
 
-            if filepath:
-                filename = os.path.basename(filepath)
-                url = f"{IMAGE_SERVER_URL}/{filename}"
+            # --- Image handling ---
+            current_image_url = data.get("current_image_url") or data.get("filepath")
+            if current_image_url:
+                # current_image_url is already a full URL from the embed worker
+                url = current_image_url
                 print(f"Processing Image: {url}")
-                messages_payload.append({
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": url}}
-                    ]
-                })
+
+                # Download the full image
+                async with httpx.AsyncClient() as http_client:
+                    resp = await http_client.get(url, timeout=10)
+                    resp.raise_for_status()
+                    img_bytes = resp.content
+
+                # Decode with OpenCV
+                img_array = np.frombuffer(img_bytes, np.uint8)
+                img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+                if img is None:
+                    raise ValueError("Failed to decode image")
+
+                # Resize while preserving aspect ratio (max dimension 640px)
+                max_size = 640
+                h, w = img.shape[:2]
+                scale = max_size / max(h, w)
+                if scale < 1:
+                    new_w = int(w * scale)
+                    new_h = int(h * scale)
+                    resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                else:
+                    resized = img  # already smaller than max_size
+
+                # Encode back to JPEG (quality 85 saves bandwidth)
+                ret, buf = cv2.imencode('.jpg', resized, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                if not ret:
+                    raise ValueError("Failed to encode resized image")
+                base64_data = base64.b64encode(buf).decode('utf-8')
+                data_url = f"data:image/jpeg;base64,{base64_data}"
+
+                # Build user message with base64 image
+                user_content = [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": data_url}}
+                ]
             else:
-                print(f"Processing Text Query: {prompt}")
-                messages_payload.append({
-                    "role": "user",
-                    "content": prompt  # simple string for text-only
-                })
+                # Text‑only query
+                user_content = prompt
+
+            messages_payload.append({"role": "user", "content": user_content})
 
             resp = await asyncio.to_thread(
                 client.chat.completions.create,
@@ -100,7 +132,7 @@ async def main():
             answer = resp.choices[0].message.content
 
             out = {
-                "id": request_id,                # use consistent "id"
+                "id": request_id,
                 "response": answer,
                 "timestamp": timestamp,
             }

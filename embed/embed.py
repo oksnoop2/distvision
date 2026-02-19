@@ -68,7 +68,7 @@ async def get_image_embedding(image_url: str, text: str = None) -> list[float]:
             # ---- Extract embedding ----
             embedding = None
 
-            # Case 1: list of results (most common)
+            # Case 1: list of results (some servers return list directly)
             if isinstance(data, list) and len(data) > 0:
                 first = data[0]
                 if isinstance(first, dict) and "embedding" in first:
@@ -82,28 +82,27 @@ async def get_image_embedding(image_url: str, text: str = None) -> list[float]:
                     else:
                         raise ValueError(f"Unexpected list format: {type(first)}")
 
-            # Case 2: direct dict with embedding
+            # Case 2: direct dict with embedding (llama.cpp server style)
             elif isinstance(data, dict) and "embedding" in data:
                 embedding = data["embedding"]
 
             if embedding is None:
                 raise ValueError(f"Could not extract embedding from response: {data}")
 
+            # --- New logic for token embeddings ---
+            # If embedding is a list of lists (multiple token embeddings), take the last one.
+            if isinstance(embedding, list) and len(embedding) > 0 and isinstance(embedding[0], list):
+                # We have a list of token embeddings; the last token corresponds to [EOS]
+                embedding = embedding[-1]
+                print(f"Extracted last token embedding, length {len(embedding)}")
+
             # Ensure it's a flat list of floats
             if not isinstance(embedding, list):
                 raise ValueError(f"Embedding is not a list: {type(embedding)}")
 
-            # Check if the list contains nested lists (unlikely, but flatten if needed)
-            if embedding and isinstance(embedding[0], list):
-                # Flatten one level (should not happen, but just in case)
-                embedding = [item for sublist in embedding for item in sublist]
-
             # Verify dimension
             if len(embedding) != EXPECTED_DIM:
                 print(f"⚠️ Warning: embedding dimension is {len(embedding)}, expected {EXPECTED_DIM}")
-
-            # Optional: print first few values for debugging
-            #print(f"Embedding first 5 values: {embedding[:5]}")
 
             return embedding
 
