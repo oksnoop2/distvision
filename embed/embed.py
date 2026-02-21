@@ -18,7 +18,7 @@ IMAGE_SERVER_URL = os.getenv("IMAGE_SERVER_URL", "http://image-server:8000")
 
 # ---------- Streams ----------
 INPUT_STREAM = "stream:embed:input"
-OUTPUT_STREAM = "stream:vision:large:input"
+OUTPUT_STREAM = "stream:rerank:input"
 STATUS_STREAM = "stream:interface:status"          # for real‑time previews
 CONSUMER_GROUP = "embed_worker"
 CONSUMER_NAME = "worker_1"
@@ -270,7 +270,7 @@ async def main():
                         "timestamp": meta.get("timestamp")
                     })
 
-                # Build output message for vision large
+                # Build output message for reranker
                 out = {
                     "id": request_id,
                     "prompt": prompt,
@@ -282,7 +282,7 @@ async def main():
                 }
 
                 await r.xadd(OUTPUT_STREAM, {"data": json.dumps(out)})
-                print(f"→ Vision Large (id: {request_id}) with {len(past_image_urls)} past images and {len(past_conversations)} past conversations")
+                print(f"→ Reranker (id: {request_id}) with {len(past_image_urls)} past images and {len(past_conversations)} past conversations")
             else:
                 print(f"Background capture indexed (id: {request_id})")
 
