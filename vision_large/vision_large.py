@@ -1,6 +1,7 @@
 import json
 import asyncio
 import os
+import re
 import redis.asyncio as redis
 from redis.exceptions import ResponseError
 from openai import AsyncOpenAI
@@ -9,6 +10,7 @@ import numpy as np
 import base64
 import httpx
 import uuid
+import humanize
 from datetime import datetime, timezone
 
 REDIS_HOST = os.getenv("REDIS_HOST", "redis-service")
@@ -26,6 +28,29 @@ CONSUMER_NAME = "worker"
 
 r = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True)
 client = AsyncOpenAI(base_url=LLM_URL, api_key="sk-no-key", timeout=300.0)
+
+
+def relative_time(iso_timestamp: str, reference: datetime = None) -> str:
+    """
+    Convert an ISO 8601 timestamp to a human‑readable relative time string.
+    Example: "2 hours ago", "yesterday", "just now".
+    If parsing fails, returns the original string.
+    """
+    if reference is None:
+        reference = datetime.now(timezone.utc)
+    try:
+        # Handle possible 'Z' suffix
+        dt = datetime.fromisoformat(iso_timestamp.replace('Z', '+00:00'))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        if reference.tzinfo is None:
+            reference = reference.replace(tzinfo=timezone.utc)
+        delta = reference - dt
+        return humanize.naturaltime(delta)
+    except Exception as e:
+        print(f"Error parsing timestamp {iso_timestamp}: {e}")
+        return iso_timestamp  # fallback
+
 
 async def process_image(image_url: str) -> str | None:
     """Download, resize, and encode image to base64 data URL. Return None on failure."""
@@ -62,6 +87,7 @@ async def process_image(image_url: str) -> str | None:
         print(f"Error processing image {image_url}: {e}")
         return None
 
+
 async def get_recent_history(request_id: str, max_turns: int = 20) -> list[dict]:
     """Fetch last `max_turns` messages from Redis chat history, excluding the current request."""
     try:
@@ -74,6 +100,7 @@ async def get_recent_history(request_id: str, max_turns: int = 20) -> list[dict]
         print(f"Error fetching chat history: {e}")
         return []
 
+
 async def store_assistant_message(request_id: str, content: str, timestamp: str):
     """Store assistant response in Redis chat history."""
     msg = {
@@ -84,6 +111,7 @@ async def store_assistant_message(request_id: str, content: str, timestamp: str)
     }
     await r.lpush("chat:history", json.dumps(msg))
     await r.ltrim("chat:history", 0, 99)
+
 
 async def send_conversation_to_embed(user: str, assistant: str, timestamp: str, image_url: str = ""):
     """Send a conversation exchange to embed:input for long‑term storage."""
@@ -97,6 +125,21 @@ async def send_conversation_to_embed(user: str, assistant: str, timestamp: str, 
     }
     await r.xadd(EMBED_STREAM, {"data": json.dumps(payload)})
     print("Stored conversation exchange in embed stream")
+
+
+def extract_thinking_and_answer(full_response: str):
+    """
+    Extract thinking content (inside <think> tags) and the final answer.
+    Returns (thinking, answer). If no thinking tags, thinking is None.
+    """
+    pattern = r'<think>(.*?)</think>(.*)'
+    match = re.search(pattern, full_response, re.DOTALL)
+    if match:
+        thinking = match.group(1).strip()
+        answer = match.group(2).strip()
+        return thinking, answer
+    return None, full_response.strip()
+
 
 async def main():
     try:
@@ -122,7 +165,7 @@ async def main():
             mid, mdata = messages[0][1][0]
             data = json.loads(mdata["data"])
 
-            print("VL INPUT:", data)
+            print(f"VL INPUT: id={data.get('id')}, prompt='{data.get('prompt', '')[:50]}...', past_images={len(data.get('past_image_urls', []))}")
 
             request_id = data.get("id")
             prompt = data.get("prompt")
@@ -155,16 +198,20 @@ async def main():
                 past_image_urls = past_image_urls[:MAX_PAST_IMAGES]
                 past_metadatas = past_metadatas[:MAX_PAST_IMAGES]
 
+            # --- Current time (used for relative formatting and system prompt) ---
+            now = datetime.now(timezone.utc)
+            current_time_human = now.strftime("%B %d, %Y at %I:%M %p %Z")
+
             # --- Build system message with enhanced instructions and current time ---
-            current_time = datetime.now(timezone.utc).isoformat()
             system_content = (
                 "You are a helpful AI assistant. You will be shown one current image and several past images, "
-                "each with a timestamp. Answer the user's question covering any of the six Ws (What, Why, When, Where, How, Who) "
+                "each with a human‑readable relative time (e.g., '2 minutes ago', 'yesterday'). "
+                "Answer the user's question covering any of the six Ws (What, Why, When, Where, How, Who) "
                 "based on the visual information and the temporal context. "
                 "If a question refers to 'today', 'now', or similar, use the current time provided below to determine if an image timestamp falls within today. "
                 "If the answer cannot be determined from the images, say 'I don't know based on the available images.' "
                 "Keep responses concise and in English.\n\n"
-                f"Current date and time (for reference): {current_time}."
+                f"Current date and time (for reference): {current_time_human}."
             )
             if context:
                 system_content += f"\n\n{context}"
@@ -192,13 +239,14 @@ async def main():
 
             image_results = await asyncio.gather(*[process_image(url) for url in image_urls])
 
-            # Build user_content in image‑first order
+            # Build user_content in image‑first order, with humanized timestamps
             user_content = []
 
             if current_image_url and image_results[0]:
+                rel_current = relative_time(timestamp, now) if timestamp else "unknown time"
                 user_content.append({
                     "type": "text",
-                    "text": f"Current image (timestamp: {timestamp}):"
+                    "text": f"Current image ({rel_current}):"
                 })
                 user_content.append({
                     "type": "image_url",
@@ -209,10 +257,14 @@ async def main():
 
             for idx, (past_url, meta, data_url) in enumerate(zip(past_image_urls, past_metadatas, image_results[1:])):
                 if data_url:
-                    past_ts = meta.get("timestamp", "unknown")
+                    past_ts = meta.get("timestamp")
+                    if past_ts:
+                        rel_past = relative_time(past_ts, now)
+                    else:
+                        rel_past = "unknown time"
                     user_content.append({
                         "type": "text",
-                        "text": f"Past image {idx+1} (timestamp: {past_ts}):"
+                        "text": f"Past image {idx+1} ({rel_past}):"
                     })
                     user_content.append({
                         "type": "image_url",
@@ -224,23 +276,38 @@ async def main():
             user_content.append({"type": "text", "text": prompt})
             messages_payload.append({"role": "user", "content": user_content})
 
-            # --- Call LLM asynchronously ---
+            # --- Call LLM asynchronously with increased token budget ---
             resp = await client.chat.completions.create(
                 model="Qwen3-VL",
                 messages=messages_payload,
-                max_tokens=1024,
+                max_tokens=3072,                     # Increased from 1024
                 temperature=1.0,
                 top_p=0.95,
                 presence_penalty=0.0,
                 stream=False
             )
 
-            answer = resp.choices[0].message.content
+            full_response = resp.choices[0].message.content
 
-            # --- Store assistant message ---
+            # --- Extract thinking and answer ---
+            thinking, answer = extract_thinking_and_answer(full_response)
+
+            # --- If thinking was present, send it as a separate status update (for debugging) ---
+            if thinking:
+                thinking_msg = {
+                    "type": "thinking",
+                    "request_id": request_id,
+                    "container": "vision_large",
+                    "content": thinking,
+                    "timestamp": timestamp
+                }
+                await r.xadd(STATUS_STREAM, {"data": json.dumps(thinking_msg)})
+                print(f"Sent thinking for {request_id}")
+
+            # --- Store assistant message (answer only, without thinking tags) ---
             await store_assistant_message(request_id, answer, datetime.now(timezone.utc).isoformat())
 
-            # --- Send exchange to embed for long‑term memory ---
+            # --- Send exchange to embed for long‑term memory (store the full response? We'll store answer only) ---
             await send_conversation_to_embed(
                 user=prompt,
                 assistant=answer,
@@ -248,7 +315,7 @@ async def main():
                 image_url=current_image_url or ""
             )
 
-            # --- Forward response to interface ---
+            # --- Forward response to interface (answer only) ---
             out = {
                 "id": request_id,
                 "response": answer,
@@ -262,6 +329,7 @@ async def main():
         except Exception as e:
             print(f"Vision Large Error: {e}")
             await asyncio.sleep(1)
+
 
 if __name__ == "__main__":
     asyncio.run(main())

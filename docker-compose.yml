@@ -1,4 +1,9 @@
 services:
+  duckling:
+    image: rasa/duckling:latest
+    ports:
+      - "8081:8080"
+
   redis-service:
     image: docker.io/library/redis:7-alpine
     ports: ["6379:6379"]
@@ -55,22 +60,7 @@ services:
       --threads 6
       --ctx-size 2048
 
-  # ---------- NEW: Reranker model service ----------
-  reranker:
-    image: ghcr.io/ggml-org/llama.cpp:server
-    volumes:
-      - ./PV/GGUF:/models:ro
-    ports:
-      - "8086:8086"
-    command: >
-      -m /models/Qwen3-VL-Reranker-2B.Q4_K_M.gguf
-      --mmproj /models/Qwen3-VL-Reranker-2B.mmproj-f16.gguf
-      --host 0.0.0.0
-      --port 8086
-      --reranking
-      --threads 4
-      --ctx-size 4096
-    # CPU only
+
 
   interface:
     build:
@@ -129,22 +119,26 @@ services:
       - CHROMA_HOST=chroma-service
       - EMBED_LLM_URL=http://embed-model:8085
       - IMAGE_SERVER_URL=http://image-server:8000
-      - RERANKER_URL=http://reranker:8086   # points to the reranker model server
+      - DUCKLING_URL=http://duckling:8000
     depends_on:
       - redis-service
       - chroma-service
       - embed-model
-      - reranker   # ensure reranker model is up
+      - duckling
 
-  # ---------- NEW: Reranker worker ----------
-  reranker-worker:
-    build:
-      context: ./reranker
-      dockerfile: Dockerfile.reranker
+
+
+  detector:
+    build: ./detector          # directory containing Dockerfile and detector.py
     environment:
       - REDIS_HOST=redis-service
-      - RERANKER_URL=http://reranker:8086
       - IMAGE_SERVER_URL=http://image-server:8000
+      - SEG_MODEL=yolo26x-seg.pt
+      - POSE_MODEL=yolo26x-pose.pt
+      - OV_MODEL=yoloe-26x-seg-pf.pt
+      - CONFIDENCE_THRESHOLD=0.3
+      - HOSTNAME=detector-1
     depends_on:
       - redis-service
-      - reranker
+      - image-server
+    restart: unless-stopped

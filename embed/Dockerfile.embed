@@ -1,15 +1,14 @@
 FROM python:3.11-slim-bookworm
 
+# Install system dependencies for Duckling (timezone data)
+RUN apt-get update && apt-get install -y tzdata && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
-# Copy only the dependency file first to leverage Docker cache
 COPY requirements.txt .
-
-# Install Python packages – no build tools, no extra system packages
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Copy the embed worker
 COPY embed.py .
 
 CMD ["python", "embed.py"]

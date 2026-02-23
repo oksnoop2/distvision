@@ -24,6 +24,8 @@ ENABLE_WEBCAM_FALLBACK = os.getenv("ENABLE_WEBCAM_FALLBACK", "true").lower() == 
 
 # Streams
 CAMERA_REQUEST_STREAM = "stream:camera:requests"
+CAMERA_RAW_STREAM = "stream:camera:raw"          # new raw stream for detector
+# EMBED_STREAM is no longer used directly; kept for reference
 EMBED_STREAM = "stream:embed:input"
 CAMERA_CONSUMER_GROUP = "camera:agents"
 CAMERA_CONSUMER_NAME = f"camera:{NODE_NAME}"
@@ -146,8 +148,9 @@ async def background_loop():
                 "timestamp": datetime.now().isoformat(),
                 "camera_node": NODE_NAME          # optional – keep for debugging, or remove
             }
-            await r.xadd(EMBED_STREAM, {"data": json.dumps(msg)}, maxlen=1000)
-            print(f"[{NODE_NAME}] → Sent to {EMBED_STREAM}")
+            # Publish to raw stream for detector
+            await r.xadd(CAMERA_RAW_STREAM, {"data": json.dumps(msg)}, maxlen=1000)
+            print(f"[{NODE_NAME}] → Sent to {CAMERA_RAW_STREAM}")
         await asyncio.sleep(BACKGROUND_INTERVAL)
 
 async def request_listener():
@@ -184,9 +187,9 @@ async def request_listener():
             if filepath:
                 resp["filepath"] = filepath
 
-            # Send to vision_small (next step in linear pipeline)
-            await r.xadd(EMBED_STREAM, {"data": json.dumps(resp)}, maxlen=1000)
-            print(f"[{NODE_NAME}] → Sent to {EMBED_STREAM}" + (" (with image)" if filepath else " (text only)"))
+            # Publish to raw stream for detector
+            await r.xadd(CAMERA_RAW_STREAM, {"data": json.dumps(resp)}, maxlen=1000)
+            print(f"[{NODE_NAME}] → Sent to {CAMERA_RAW_STREAM}" + (" (with image)" if filepath else " (text only)"))
 
             await r.xack(CAMERA_REQUEST_STREAM, CAMERA_CONSUMER_GROUP, mid)
         except Exception as e:
