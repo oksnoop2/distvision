@@ -35,21 +35,21 @@ log = logging.getLogger(SERVICE_NAME)
 
 
 # ---------- Environment ----------
-REDIS_HOST      = os.getenv("REDIS_HOST", "redis-service")
-CHROMA_HOST     = os.getenv("CHROMA_HOST", "chroma-service")
-EMBED_URL       = os.getenv("EMBED_LLM_URL", "http://embed-model:8085")
-DUCKLING_URL    = os.getenv("DUCKLING_URL", "http://duckling:8000")
+REDIS_HOST       = os.getenv("REDIS_HOST", "redis-service")
+CHROMA_HOST      = os.getenv("CHROMA_HOST", "chroma-service")
+EMBED_URL        = os.getenv("EMBED_LLM_URL", "http://embed-model:8085")
+DUCKLING_URL     = os.getenv("DUCKLING_URL", "http://duckling:8000")
 IMAGE_SERVER_URL = os.getenv("IMAGE_SERVER_URL", "http://image-server:8000")
 
 log.info(f"EMBED_URL={EMBED_URL} DUCKLING_URL={DUCKLING_URL}")
 
 # ---------- Streams ----------
-INPUT_STREAM        = "stream:embed:input"
-OUTPUT_STREAM       = "stream:vision:large:input"   # direct — no reranker
-STATUS_STREAM       = "stream:interface:status"
-DLQ_STREAM          = "stream:dlq:embed"
-CONSUMER_GROUP      = "embed_worker"
-CONSUMER_NAME       = f"worker_{os.getenv('HOSTNAME', 'default')}"
+INPUT_STREAM   = "stream:embed:input"
+OUTPUT_STREAM  = "stream:vision:large:input"   # direct — no reranker
+STATUS_STREAM  = "stream:interface:status"
+DLQ_STREAM     = "stream:dlq:embed"
+CONSUMER_GROUP = "embed_worker"
+CONSUMER_NAME  = f"worker_{os.getenv('HOSTNAME', 'default')}"
 
 # ---------- Chroma collections ----------
 IMAGE_COLLECTION        = os.getenv("IMAGE_COLLECTION", "visual_memory_images")
@@ -101,7 +101,6 @@ def rrf_merge(
 
     Returns (merged_paths, merged_metadatas) in descending RRF score order.
     """
-    # Build lookup: id → (path, metadata)
     id_to_data: dict[str, tuple[str, dict]] = {}
     for id_, meta, path in zip(image_ids, image_meta, image_paths):
         id_to_data[id_] = (path, meta)
@@ -132,8 +131,13 @@ async def extract_time_filter_http(
 ) -> dict | None:
     """
     Call Duckling to parse time expressions.
-    Returns a ChromaDB where-clause dict using numeric epoch values,
-    or None if no time reference is found.
+    Returns a dict with timestamp_epoch conditions, or None if no time
+    reference is found.
+
+    Important: we store the raw $gte/$lte values here and let
+    build_where_clause split them into separate ChromaDB conditions.
+    ChromaDB requires exactly one operator per expression — it cannot
+    accept {"$gte": x, "$lte": y} in a single field dict.
     """
     payload = {
         "locale": "en_US",
@@ -167,13 +171,13 @@ async def extract_time_filter_http(
                 if from_val and to_val:
                     from_epoch = datetime.fromisoformat(from_val.replace("Z", "+00:00")).timestamp()
                     to_epoch   = datetime.fromisoformat(to_val.replace("Z", "+00:00")).timestamp()
+                    # Store as a range dict — build_where_clause will split it
                     return {"timestamp_epoch": {"$gte": from_epoch, "$lte": to_epoch}}
 
             elif "value" in value:
                 exact = value["value"]
                 if isinstance(exact, str):
                     epoch = datetime.fromisoformat(exact.replace("Z", "+00:00")).timestamp()
-                    # Wrap in $eq — bare float is not a valid ChromaDB operator
                     return {"timestamp_epoch": {"$eq": epoch}}
 
         elif isinstance(value, str):
@@ -267,7 +271,6 @@ def _extract_embedding(data) -> list[float]:
         raise ValueError(f"Embedding is not a list: {type(embedding)}")
 
     if len(embedding) != EXPECTED_DIM:
-        # Hard failure — mismatched dimensions corrupt the HNSW index
         raise ValueError(
             f"Embedding dimension mismatch: got {len(embedding)}, expected {EXPECTED_DIM}. "
             f"Check that the embed model has not changed."
@@ -280,8 +283,14 @@ def _extract_embedding(data) -> list[float]:
 def build_where_clause(exclude_timestamp: str | None, time_filter: dict | None) -> dict | None:
     """
     Assemble a ChromaDB where clause from optional exclusion and time filter.
-    Handles single conditions, $and combinations, and ensures all operator
-    expressions are valid ChromaDB filter syntax.
+
+    Critical constraint: ChromaDB requires exactly one operator per field
+    expression. A range like {"$gte": x, "$lte": y} is NOT valid as a single
+    expression — it must be split into two separate conditions joined by $and.
+
+    Valid:   {"timestamp_epoch": {"$gte": x}}
+    Valid:   {"$and": [{"timestamp_epoch": {"$gte": x}}, {"timestamp_epoch": {"$lte": y}}]}
+    Invalid: {"timestamp_epoch": {"$gte": x, "$lte": y}}  ← ChromaDB rejects this
     """
     conditions = []
 
@@ -290,8 +299,18 @@ def build_where_clause(exclude_timestamp: str | None, time_filter: dict | None) 
 
     if time_filter:
         ts_cond = time_filter.get("timestamp_epoch")
-        if ts_cond is not None:
-            conditions.append({"timestamp_epoch": ts_cond})
+        if isinstance(ts_cond, dict):
+            # Split multi-operator range into individual conditions
+            if "$gte" in ts_cond:
+                conditions.append({"timestamp_epoch": {"$gte": ts_cond["$gte"]}})
+            if "$lte" in ts_cond:
+                conditions.append({"timestamp_epoch": {"$lte": ts_cond["$lte"]}})
+            if "$eq" in ts_cond:
+                conditions.append({"timestamp_epoch": {"$eq": ts_cond["$eq"]}})
+        elif ts_cond is not None:
+            # Bare value — shouldn't reach here given extract_time_filter_http
+            # always wraps in an operator dict, but handle defensively
+            conditions.append({"timestamp_epoch": {"$eq": float(ts_cond)}})
 
     if not conditions:
         return None
@@ -303,9 +322,9 @@ def build_where_clause(exclude_timestamp: str | None, time_filter: dict | None) 
 # ---------- Dead letter / pending message recovery ----------
 async def recover_pending_messages():
     """
-    On startup, claim any messages that were left pending (unacked) by a
-    previous worker that crashed. Messages pending longer than MAX_PENDING_AGE
-    are moved to the DLQ for inspection rather than retried blindly.
+    On startup, claim any messages left pending by a previous worker that
+    crashed. Messages pending longer than MAX_PENDING_AGE go to the DLQ
+    for inspection rather than being retried blindly.
     """
     try:
         pending = await r.xpending(INPUT_STREAM, CONSUMER_GROUP)
@@ -322,13 +341,13 @@ async def recover_pending_messages():
             start_id="0-0",
             count=100,
         )
-        # xautoclaim returns (next_id, messages, deleted_ids)
         messages = claimed[1] if isinstance(claimed, (list, tuple)) else []
         if not messages:
             return
 
         for mid, fields in messages:
-            log.warning(f"Moving stale pending message {mid} to DLQ", extra={"request_id": None})
+            log.warning(f"Moving stale pending message {mid} to DLQ",
+                        extra={"request_id": None})
             await r.xadd(DLQ_STREAM, {"original_id": mid, "data": fields.get("data", "")})
             await r.xack(INPUT_STREAM, CONSUMER_GROUP, mid)
 
@@ -347,7 +366,6 @@ async def handle_conversation(data: dict):
 
     embedding = await get_text_embedding(combined)
 
-    # Parse epoch for temporal filtering on future queries
     try:
         dt = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
         timestamp_epoch = dt.timestamp()
@@ -357,7 +375,7 @@ async def handle_conversation(data: dict):
     memory_id = f"conv_{timestamp}_{uuid.uuid4().hex[:8]}"
     metadata  = {
         "timestamp":       timestamp,
-        "timestamp_epoch": timestamp_epoch,   # enables time-filtered conversation retrieval
+        "timestamp_epoch": timestamp_epoch,
         "user":            user_text,
         "assistant":       assistant_text,
         "image_url":       data.get("image_url", ""),
@@ -381,12 +399,12 @@ async def handle_image(data: dict, rlog: logging.LoggerAdapter):
       2. If yes, run dual-embedding retrieval with RRF merge.
       3. Forward to vision_large with appropriately sized context.
     """
-    request_id       = data.get("id")
-    prompt           = data.get("prompt")
-    filepath         = data.get("filepath")
-    timestamp        = data.get("timestamp")
+    request_id        = data.get("id")
+    prompt            = data.get("prompt")
+    filepath          = data.get("filepath")
+    timestamp         = data.get("timestamp")
     detection_summary = data.get("detection_summary", "")
-    detection_json   = data.get("detection_json", "")
+    detection_json    = data.get("detection_json", "")
 
     if not request_id or not filepath:
         rlog.warning(f"Missing id or filepath, skipping: {data}")
@@ -441,7 +459,10 @@ async def handle_image(data: dict, rlog: logging.LoggerAdapter):
         metadatas=[metadata],
         documents=[document_text if document_text else ""],
     )
-    rlog.info(f"Indexed image {memory_id}" + (f" doc='{document_text[:60]}...'" if document_text else ""))
+    rlog.info(
+        f"Indexed image {memory_id}"
+        + (f" doc='{document_text[:60]}...'" if document_text else "")
+    )
 
     # Background capture — nothing more to do
     if not prompt:
@@ -459,8 +480,9 @@ async def handle_image(data: dict, rlog: logging.LoggerAdapter):
         time_filter=time_filter,
     )
 
-    past_image_urls  = []
-    stripped_metas   = []
+    past_image_urls = []
+    stripped_metas  = []
+    text_embedding  = None   # may be computed below, reused for conv retrieval
 
     if needs_history(prompt, time_filter):
         rlog.info("Temporal query detected — running dual-embedding retrieval")
@@ -471,9 +493,9 @@ async def handle_image(data: dict, rlog: logging.LoggerAdapter):
             n_results=RETRIEVAL_COUNT,
             where=where_clause,
         )
-        img_ids    = img_results.get("ids", [[]])[0]
-        img_metas  = img_results.get("metadatas", [[]])[0]
-        img_paths  = [
+        img_ids   = img_results.get("ids", [[]])[0]
+        img_metas = img_results.get("metadatas", [[]])[0]
+        img_paths = [
             f"{IMAGE_SERVER_URL}/{os.path.basename(m['filepath'])}"
             for m in img_metas
         ]
@@ -524,10 +546,11 @@ async def handle_image(data: dict, rlog: logging.LoggerAdapter):
         rlog.info("Present-moment query — skipping past image retrieval")
 
     # ---------- Conversation retrieval ----------
-    text_embedding = await get_text_embedding(prompt) if not needs_history(prompt, time_filter) \
-        else text_embedding  # reuse if already computed above
+    # Reuse text_embedding if already computed above, otherwise compute now
+    if text_embedding is None:
+        text_embedding = await get_text_embedding(prompt)
 
-    # Build conversation where clause — time filter now applied here too
+    # Apply same time filter to conversations so temporal context is consistent
     conv_where = build_where_clause(
         exclude_timestamp=None,
         time_filter=time_filter,
@@ -547,15 +570,15 @@ async def handle_image(data: dict, rlog: logging.LoggerAdapter):
         for m in conv_results.get("metadatas", [[]])[0]
     ]
 
-    # ---------- Forward to vision_large (no reranker) ----------
+    # ---------- Forward to vision_large ----------
     out = {
-        "id":                request_id,
-        "prompt":            prompt,
-        "current_image_url": image_url,
-        "past_image_urls":   past_image_urls,
-        "past_metadatas":    stripped_metas,
+        "id":                 request_id,
+        "prompt":             prompt,
+        "current_image_url":  image_url,
+        "past_image_urls":    past_image_urls,
+        "past_metadatas":     stripped_metas,
         "past_conversations": past_conversations,
-        "timestamp":         timestamp,
+        "timestamp":          timestamp,
     }
     await r.xadd(OUTPUT_STREAM, {"data": json.dumps(out)})
     rlog.info(
@@ -593,7 +616,6 @@ async def main():
             data       = json.loads(mdata["data"])
             request_id = data.get("id", "unknown")
 
-            # Per-request logger with request_id injected into every line
             rlog = logging.LoggerAdapter(log, {"request_id": request_id})
 
             try:
