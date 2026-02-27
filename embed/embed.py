@@ -48,6 +48,7 @@ INPUT_STREAM   = "stream:embed:input"
 OUTPUT_STREAM  = "stream:vision:large:input"   # direct — no reranker
 STATUS_STREAM  = "stream:interface:status"
 DLQ_STREAM     = "stream:dlq:embed"
+VP_STREAM      = "stream:detector:vp"          # detector input for visual prompt jobs
 CONSUMER_GROUP = "embed_worker"
 CONSUMER_NAME  = f"worker_{os.getenv('HOSTNAME', 'default')}"
 
@@ -60,6 +61,7 @@ RETRIEVAL_COUNT = 10
 EXPECTED_DIM    = 2048
 RRF_K           = 60       # standard constant for Reciprocal Rank Fusion
 MAX_PENDING_AGE = 300_000  # ms — reclaim messages stuck longer than 5 minutes
+VP_REPLY_TIMEOUT = 5.0     # seconds to wait for visual prompt verification
 
 # ---------- Temporal intent detection ----------
 TEMPORAL_SIGNALS = {
@@ -356,6 +358,19 @@ async def recover_pending_messages():
         log.warning(f"Pending recovery failed (non-fatal): {e}")
 
 
+# ---------- Helper for VP reply ----------
+async def _read_vp_reply(stream: str) -> dict | None:
+    """Read one message from a stream (blocking) and return parsed dict."""
+    try:
+        messages = await r.xread(streams={stream: "0-0"}, count=1, block=5000)
+        if messages and messages[0][1]:
+            _, fields = messages[0][1][0]
+            return json.loads(fields["data"])
+    except Exception as e:
+        log.warning(f"Error reading VP reply stream {stream}: {e}")
+    return None
+
+
 # ---------- Message handlers ----------
 async def handle_conversation(data: dict):
     """Store a conversation exchange in the conversation ChromaDB collection."""
@@ -397,7 +412,10 @@ async def handle_image(data: dict, rlog: logging.LoggerAdapter):
     For user requests (has prompt):
       1. Determine whether historical context is needed.
       2. If yes, run dual-embedding retrieval with RRF merge.
-      3. Forward to vision_large with appropriately sized context.
+      3. (NEW) Dispatch a visual prompt verification job to detector
+         using the top retrieved past image with stored detection data.
+      4. Forward to vision_large with appropriately sized context,
+         including the enriched detection summary.
     """
     request_id        = data.get("id")
     prompt            = data.get("prompt")
@@ -483,6 +501,7 @@ async def handle_image(data: dict, rlog: logging.LoggerAdapter):
     past_image_urls = []
     stripped_metas  = []
     text_embedding  = None   # may be computed below, reused for conv retrieval
+    vp_summary = ""          # will hold additional summary from VP, if any
 
     if needs_history(prompt, time_filter):
         rlog.info("Temporal query detected — running dual-embedding retrieval")
@@ -531,6 +550,46 @@ async def handle_image(data: dict, rlog: logging.LoggerAdapter):
             f"→ {len(merged_paths)} merged"
         )
 
+        # ---------- Visual Prompt Verification ----------
+        # Find the first past image that has stored detection data
+        top_past_meta = None
+        top_past_url = None
+        for i, meta in enumerate(merged_metas):
+            if "detection_data" in meta:
+                top_past_meta = meta
+                top_past_url = merged_paths[i]
+                break
+
+        if top_past_meta and top_past_url:
+            reply_stream = f"stream:detector:reply:{request_id}"
+            vp_job = {
+                "id": request_id,
+                "current_image_url": image_url,
+                "past_image_url": top_past_url,
+                "past_detection_json": top_past_meta["detection_data"],
+                "reply_to": reply_stream,
+            }
+            await r.xadd(VP_STREAM, {"data": json.dumps(vp_job)})
+            rlog.info(f"Dispatched VP job for past image, waiting up to {VP_REPLY_TIMEOUT}s")
+
+            try:
+                vp_result = await asyncio.wait_for(
+                    _read_vp_reply(reply_stream),
+                    timeout=VP_REPLY_TIMEOUT
+                )
+                if vp_result:
+                    vp_summary = vp_result.get("vp_detection_summary", "")
+                    if vp_summary:
+                        rlog.info(f"VP result: {vp_summary[:100]}...")
+            except asyncio.TimeoutError:
+                rlog.warning("VP job timed out, continuing without VP")
+            except Exception as e:
+                rlog.error(f"VP job failed: {e}", exc_info=True)
+            finally:
+                # Clean up the temporary reply stream
+                await r.delete(reply_stream)
+        # ---------- End VP ----------
+
         # Send image preview to interface
         status_msg = {
             "type":              "image_update",
@@ -570,6 +629,13 @@ async def handle_image(data: dict, rlog: logging.LoggerAdapter):
         for m in conv_results.get("metadatas", [[]])[0]
     ]
 
+    # ---------- Enrich detection summary with VP results ----------
+    if vp_summary:
+        if detection_summary:
+            detection_summary += f" | Verified past: {vp_summary}"
+        else:
+            detection_summary = f"Verified past: {vp_summary}"
+
     # ---------- Forward to vision_large ----------
     out = {
         "id":                 request_id,
@@ -578,12 +644,14 @@ async def handle_image(data: dict, rlog: logging.LoggerAdapter):
         "past_image_urls":    past_image_urls,
         "past_metadatas":     stripped_metas,
         "past_conversations": past_conversations,
+        "detection_summary":  detection_summary,   # now includes VP if any
         "timestamp":          timestamp,
     }
     await r.xadd(OUTPUT_STREAM, {"data": json.dumps(out)})
     rlog.info(
         f"→ vision_large | past_images={len(past_image_urls)} "
-        f"past_conversations={len(past_conversations)}"
+        f"past_conversations={len(past_conversations)} "
+        f"vp_included={'yes' if vp_summary else 'no'}"
     )
 
 

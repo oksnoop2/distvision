@@ -55,8 +55,8 @@ CONSUMER_NAME  = f"worker_{os.getenv('HOSTNAME', 'default')}"
 MAX_PENDING_AGE = 300_000  # ms
 
 # ---------- Clients ----------
-r          = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True)
-llm_client = AsyncOpenAI(base_url=LLM_URL, api_key="sk-no-key", timeout=300.0)
+r           = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True)
+llm_client  = AsyncOpenAI(base_url=LLM_URL, api_key="sk-no-key", timeout=300.0)
 http_client = httpx.AsyncClient(timeout=30.0)
 
 
@@ -139,11 +139,32 @@ async def send_conversation_to_embed(user: str, assistant: str,
 def extract_thinking_and_answer(full_response: str) -> tuple[str | None, str]:
     """
     Split <think>...</think> from the final answer.
-    Returns (thinking, answer). thinking is None if no tags present.
+
+    Qwen3 occasionally terminates inside the thinking block without emitting
+    a visible answer — particularly when it reasons itself into uncertainty.
+    In that case group(2) is empty after strip().
+
+    Rather than returning an empty answer (which triggers the generic fallback
+    error message), we surface the thinking content itself. The user gets the
+    model's actual reasoning instead of "I wasn't able to generate a response."
+
+    The system prompt instructs the model to always write a visible answer
+    after </think>, which reduces but doesn't eliminate this case.
+
+    Returns:
+        (thinking, answer)
+        thinking — content inside <think> tags, or None if no tags present
+        answer   — text after </think>; falls back to thinking if empty;
+                   falls back to full_response if no tags at all
     """
     match = re.search(r"<think>(.*?)</think>(.*)", full_response, re.DOTALL)
     if match:
-        return match.group(1).strip(), match.group(2).strip()
+        thinking = match.group(1).strip()
+        answer   = match.group(2).strip()
+        if not answer:
+            # Model ended inside thinking — use thinking as the answer.
+            return thinking, thinking
+        return thinking, answer
     return None, full_response.strip()
 
 
@@ -153,7 +174,7 @@ def build_messages(
     timestamp: str,
     now: datetime,
     current_image_data: str | None,
-    past_images: list[tuple[str, dict]],   # [(data_url, metadata), ...]
+    past_images: list[tuple[str, dict]],
     past_conversations: list[dict],
     recent_history: list[dict],
     detection_summary: str,
@@ -161,20 +182,12 @@ def build_messages(
     """
     Build the messages payload for the VLM.
 
-    Design decisions:
-    - Images come before the question so the VLM encodes them into its
-      attention context before reading the query.
-    - Detection summary is framed as supplementary hints, not ground truth.
-      The VLM is explicitly instructed to trust its own visual observations
-      over the summary. This prevents it from answering "0 pink items"
-      because the detector missed them.
-    - Past conversations are injected as assistant/user turns in the correct
-      chat history position so the model has genuine conversational context.
-    - Chat history sits between the system message and the current user turn
-      so it looks like a real ongoing conversation.
-    - The current user turn is structured: images first → detection hint →
-      question last. This order maximises the chance the model looks at the
-      image before reading the question.
+    Ordering rationale:
+    - Images before the question — VLM encodes visual context first.
+    - Detection summary labelled as incomplete hints — prevents the model
+      from deferring to detector output over its own visual observation.
+    - System prompt explicitly forbids ending inside a <think> block, which
+      is the root cause of the empty-response failures.
     """
     current_time_str = now.strftime("%B %d, %Y at %I:%M %p UTC")
 
@@ -197,17 +210,23 @@ ANSWERING:
 - Keep answers concise and direct. Do not narrate your reasoning process in the
   final answer unless asked.
 
+IMPORTANT — THINKING MODEL BEHAVIOUR:
+- You must ALWAYS write a visible answer after your </think> block.
+- Never end your response inside a <think> block.
+- If you are uncertain, write your best answer anyway and note the uncertainty
+  briefly (e.g. "I can't clearly see X from this angle.").
+- A response that ends at </think> with nothing after it is a failure.
+
 Current date and time: {current_time_str}"""
 
     messages: list[dict] = [{"role": "system", "content": system_content}]
 
-    # Inject relevant past conversations as history turns
-    # These are semantically retrieved exchanges, not chronological chat log
+    # Inject semantically retrieved past conversations as history turns
     if past_conversations:
         for conv in past_conversations:
-            u = conv.get("user", "")
-            a = conv.get("assistant", "")
-            ts = conv.get("timestamp", "")
+            u   = conv.get("user", "")
+            a   = conv.get("assistant", "")
+            ts  = conv.get("timestamp", "")
             rel = relative_time(ts, now) if ts else ""
             label = f" [{rel}]" if rel else ""
             if u:
@@ -215,28 +234,26 @@ Current date and time: {current_time_str}"""
             if a:
                 messages.append({"role": "assistant", "content": a})
 
-    # Inject recent chat history (maintains conversational continuity)
+    # Recent chat history for conversational continuity
     for msg in recent_history:
         if msg.get("role") in ("user", "assistant"):
             messages.append({"role": msg["role"], "content": msg["content"]})
 
-    # Build the current user turn
+    # Current user turn: past images → current image → question
     user_content: list[dict] = []
 
-    # Past images first (oldest context)
     for data_url, meta in past_images:
-        ts  = meta.get("timestamp", "")
-        rel = relative_time(ts, now) if ts else "unknown time"
+        ts      = meta.get("timestamp", "")
+        rel     = relative_time(ts, now) if ts else "unknown time"
         summary = meta.get("summary", "")
-        label = f"Past image ({rel})"
+        label   = f"Past image ({rel})"
         if summary:
             label += f" — detector hints: {summary}"
         user_content.append({"type": "text", "text": label + ":"})
         user_content.append({"type": "image_url", "image_url": {"url": data_url}})
 
-    # Current image
     if current_image_data:
-        rel_current = relative_time(timestamp, now) if timestamp else "just now"
+        rel_current   = relative_time(timestamp, now) if timestamp else "just now"
         current_label = f"Current image ({rel_current})"
         if detection_summary:
             current_label += (
@@ -247,9 +264,7 @@ Current date and time: {current_time_str}"""
         user_content.append({"type": "image_url",
                               "image_url": {"url": current_image_data}})
 
-    # Question last — model has seen all images before reading the query
     user_content.append({"type": "text", "text": prompt})
-
     messages.append({"role": "user", "content": user_content})
     return messages
 
@@ -322,18 +337,17 @@ async def main():
 
 
 async def process_message(data: dict, rlog: logging.LoggerAdapter):
-    request_id  = data.get("id")
-    prompt      = data.get("prompt")
-    timestamp   = data.get("timestamp")
+    request_id = data.get("id")
+    prompt     = data.get("prompt")
+    timestamp  = data.get("timestamp")
 
     if not request_id or not prompt:
         rlog.warning(f"Missing id or prompt — skipping: {data}")
         return
 
-    rlog.info(f"Processing prompt='{prompt[:60]}...' " if len(prompt) > 60
-              else f"Processing prompt='{prompt}'")
+    rlog.info(f"Processing prompt='{prompt[:60]}'" +
+              ("..." if len(prompt) > 60 else ""))
 
-    # Status update to interface
     await r.xadd(STATUS_STREAM, {"data": json.dumps({
         "type":       "status",
         "request_id": request_id,
@@ -343,19 +357,17 @@ async def process_message(data: dict, rlog: logging.LoggerAdapter):
     })})
 
     current_image_url  = data.get("current_image_url") or data.get("filepath")
-    past_image_urls    = data.get("past_image_urls", [])[:MAX_PAST_IMAGES]
-    past_metadatas     = data.get("past_metadatas",  [])[:MAX_PAST_IMAGES]
+    past_image_urls    = data.get("past_image_urls",    [])[:MAX_PAST_IMAGES]
+    past_metadatas     = data.get("past_metadatas",     [])[:MAX_PAST_IMAGES]
     past_conversations = data.get("past_conversations", [])
-    detection_summary  = data.get("detection_summary", "")
+    detection_summary  = data.get("detection_summary",  "")
 
     now = datetime.now(timezone.utc)
 
-    # Fetch and encode all images concurrently
     all_urls = ([current_image_url] if current_image_url else []) + past_image_urls
     all_data = await asyncio.gather(*[process_image(u) for u in all_urls],
                                     return_exceptions=True)
 
-    # Split results back out
     current_image_data: str | None = None
     if current_image_url:
         result = all_data[0]
@@ -363,9 +375,9 @@ async def process_message(data: dict, rlog: logging.LoggerAdapter):
             rlog.warning(f"Failed to fetch current image: {result}")
         else:
             current_image_data = result
-        past_results = all_data[1:]
+        past_results = list(all_data[1:])
     else:
-        past_results = all_data
+        past_results = list(all_data)
 
     past_images: list[tuple[str, dict]] = []
     for url, result, meta in zip(past_image_urls, past_results, past_metadatas):
@@ -379,10 +391,7 @@ async def process_message(data: dict, rlog: logging.LoggerAdapter):
         f"past={len(past_images)}"
     )
 
-    # Fetch chat history
-    recent_history = await get_recent_history(request_id, MAX_HISTORY)
-
-    # Build messages
+    recent_history   = await get_recent_history(request_id, MAX_HISTORY)
     messages_payload = build_messages(
         prompt=prompt,
         timestamp=timestamp or "",
@@ -401,7 +410,6 @@ async def process_message(data: dict, rlog: logging.LoggerAdapter):
         f"{len(past_conversations)} retrieved conversations"
     )
 
-    # Call LLM
     resp = await llm_client.chat.completions.create(
         model="Qwen3-VL",
         messages=messages_payload,
@@ -413,10 +421,29 @@ async def process_message(data: dict, rlog: logging.LoggerAdapter):
     )
 
     full_response = resp.choices[0].message.content or ""
+
+    # Log raw response shape — critical for diagnosing the empty-answer case.
+    # has_think + has_close_think but short preview = model ended in think block.
+    rlog.info(
+        f"Raw response: len={len(full_response)} "
+        f"has_think={'<think>' in full_response} "
+        f"has_close_think={'</think>' in full_response} "
+        f"preview='{full_response[:150].replace(chr(10), ' ')}'"
+    )
+
     thinking, answer = extract_thinking_and_answer(full_response)
 
+    # Warn when thinking fallback fired — means the system prompt instruction
+    # to always answer after </think> was not followed.
+    if thinking is not None and answer == thinking:
+        rlog.warning(
+            "Model terminated inside thinking block — no visible answer. "
+            "Surfacing thinking as answer. "
+            f"Preview: '{thinking[:120]}'"
+        )
+
     if not answer:
-        rlog.warning("Empty answer after thinking extraction — sending error to interface")
+        rlog.warning("Completely empty response from model")
         answer = "I wasn't able to generate a response. Please try again."
 
     if thinking:
@@ -431,7 +458,6 @@ async def process_message(data: dict, rlog: logging.LoggerAdapter):
 
     rlog.info(f"Answer: {answer[:120]}{'...' if len(answer) > 120 else ''}")
 
-    # Persist to chat history and long-term memory
     response_ts = datetime.now(timezone.utc).isoformat()
     await store_assistant_message(request_id, answer, response_ts)
     await send_conversation_to_embed(
@@ -441,7 +467,6 @@ async def process_message(data: dict, rlog: logging.LoggerAdapter):
         image_url=current_image_url or "",
     )
 
-    # Forward answer to interface
     await r.xadd(OUTPUT_STREAM, {"data": json.dumps({
         "id":        request_id,
         "response":  answer,

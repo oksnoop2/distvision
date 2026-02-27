@@ -13,23 +13,24 @@ import numpy as np
 import redis.asyncio as redis
 from redis.exceptions import ResponseError
 from ultralytics import YOLO
+from ultralytics.models.yolo.yoloe import YOLOEVPSegPredictor
 
 # ---------- Structured JSON Logging ----------
 SERVICE_NAME = "detector"
 
 class JsonFormatter(logging.Formatter):
     def format(self, record):
-        log_entry = {
+        entry = {
             "ts":      self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
             "level":   record.levelname,
             "service": SERVICE_NAME,
             "msg":     record.getMessage(),
         }
         if hasattr(record, "request_id"):
-            log_entry["request_id"] = record.request_id
+            entry["request_id"] = record.request_id
         if record.exc_info:
-            log_entry["exc"] = self.formatException(record.exc_info)
-        return json.dumps(log_entry)
+            entry["exc"] = self.formatException(record.exc_info)
+        return json.dumps(entry)
 
 handler = logging.StreamHandler(sys.stdout)
 handler.setFormatter(JsonFormatter())
@@ -40,31 +41,30 @@ log = logging.getLogger(SERVICE_NAME)
 REDIS_HOST       = os.getenv("REDIS_HOST", "redis-service")
 IMAGE_SERVER_URL = os.getenv("IMAGE_SERVER_URL", "http://image-server:8000")
 
-SEG_MODEL  = os.getenv("SEG_MODEL",      "yolo26x-seg.pt")
-POSE_MODEL = os.getenv("POSE_MODEL",     "yolo26x-pose.pt")
+SEG_MODEL     = os.getenv("SEG_MODEL",      "yolo26x-seg.pt")
+POSE_MODEL    = os.getenv("POSE_MODEL",     "yolo26x-pose.pt")
+OV_MODEL      = os.getenv("OV_MODEL",       "yoloe-26x-seg-pf.pt")  # prompt-free
+OV_TEXT_MODEL = os.getenv("OV_TEXT_MODEL",  "yoloe-26x-seg.pt")     # text + visual prompted
 
-# Two separate OV model variants:
-#   OV_MODEL      — prompt-free (-pf) variant, used for background detection.
-#                   Faster, fixed vocabulary, does NOT support set_classes().
-#   OV_TEXT_MODEL — text-prompted variant (no -pf suffix), used for
-#                   query-directed detection. Supports set_classes().
-#
-# This split is required because calling set_classes() on the prompt-free
-# model raises: "Prompt-free model does not support setting classes."
-OV_MODEL      = os.getenv("OV_MODEL",      "yoloe-26x-seg-pf.pt")
-OV_TEXT_MODEL = os.getenv("OV_TEXT_MODEL", "yoloe-26x-seg.pt")
-
-CONFIDENCE_THRESHOLD       = float(os.getenv("CONFIDENCE_THRESHOLD", "0.3"))
+CONFIDENCE_THRESHOLD       = float(os.getenv("CONFIDENCE_THRESHOLD",       "0.3"))
 QUERY_CONFIDENCE_THRESHOLD = float(os.getenv("QUERY_CONFIDENCE_THRESHOLD", "0.2"))
+VP_CONFIDENCE_THRESHOLD    = float(os.getenv("VP_CONFIDENCE_THRESHOLD",    "0.25"))
 MODEL_POOL_SIZE            = int(os.getenv("MODEL_POOL_SIZE", "1"))
 
-INPUT_STREAM   = "stream:camera:raw"
+# Streams
+#   CAPTURE_STREAM  — background captures and user query captures (camera_agent → detector)
+#   VP_STREAM       — visual prompt verification jobs dispatched by embed
+#                     for temporal queries; result goes back to a per-request reply stream
+CAPTURE_STREAM = "stream:camera:raw"
+VP_STREAM      = "stream:detector:vp"
 OUTPUT_STREAM  = "stream:embed:input"
 DLQ_STREAM     = "stream:dlq:detector"
 CONSUMER_GROUP = "detector_workers"
 CONSUMER_NAME  = f"detector_{os.getenv('HOSTNAME', 'unknown')}"
 
-MAX_PENDING_AGE = 300_000  # ms
+MAX_VP_BBOXES   = 8        # max past-frame bboxes to use as visual prompts
+MAX_PENDING_AGE = 300_000  # ms before a stale pending message is DLQ'd
+
 
 # ---------- Visual concept extraction ----------
 COLOR_NAMES = [
@@ -87,31 +87,31 @@ _STOPWORDS = {
     "look", "for", "that", "this", "those", "these", "some", "all",
 }
 
+_TRAILING_VERBS = {"are", "is", "was", "were", "be", "been", "have", "has"}
+
 
 def extract_visual_concepts(prompt: str) -> list[str]:
     """
-    Extract visual class strings from a natural language prompt for use
-    as YOLOE text-prompted detection classes.
+    Extract YOLOE text-prompt class strings from a natural language query.
 
-    Strategy:
-      1. Find explicit "color + object" phrases — highest signal.
-      2. Find standalone color references.
-      3. Extract remaining meaningful nouns.
-      4. Include full prompt as holistic fallback.
+    Priority:
+      1. "color + noun" phrases  →  "pink blanket", "pink object", "pink"
+      2. Standalone meaningful nouns
+      3. Full prompt as holistic fallback
 
-    Examples:
-      "How many pink items do you see?" →
-        ["pink item", "pink object", "pink", "items", "How many pink items..."]
-
-      "Is there a red cup on the desk?" →
-        ["red cup", "red object", "red", "cup", "desk", "Is there a red..."]
+    Trailing auxiliary verbs are stripped from the captured noun so
+    "pink things are" becomes "pink things".
     """
     concepts: list[str] = []
     lower = prompt.lower()
 
     for match in _COLOR_PATTERN.finditer(lower):
-        color  = match.group(1).strip()
-        noun   = match.group(2).strip()
+        color = match.group(1).strip()
+        noun  = match.group(2).strip()
+        noun_words = [w for w in noun.split() if w not in _TRAILING_VERBS]
+        noun = " ".join(noun_words).strip()
+        if not noun:
+            continue
         phrase = f"{color} {noun}"
         concepts.append(phrase)
         if f"{color} object" not in concepts:
@@ -122,13 +122,12 @@ def extract_visual_concepts(prompt: str) -> list[str]:
     words = re.findall(r"\b[a-z]{3,}\b", lower)
     for word in words:
         if word not in _STOPWORDS and word not in COLOR_NAMES and word not in concepts:
-            already_covered = any(word in c for c in concepts)
-            if not already_covered:
+            if not any(word in c for c in concepts):
                 concepts.append(word)
 
     concepts.append(prompt.strip())
 
-    seen: set[str] = set()
+    seen:   set[str]  = set()
     unique: list[str] = []
     for c in concepts:
         if c not in seen:
@@ -153,69 +152,87 @@ class ModelPool:
         log.info(f"Model pool ready: {self._path}")
 
     async def run(self, image: np.ndarray, **kwargs) -> list:
-        """Acquire a model instance, run inference, return to pool."""
         model = await self._queue.get()
         try:
-            results = await asyncio.to_thread(model, image, **kwargs)
-            return results
+            return await asyncio.to_thread(model, image, **kwargs)
         finally:
             await self._queue.put(model)
 
     async def run_with_classes(self, image: np.ndarray, classes: list[str], **kwargs) -> list:
         """
-        Run YOLOE with custom text-prompted classes.
-
-        Only valid on text-prompted model variants (no -pf suffix).
-        Holds the model for the full set_classes + inference cycle before
-        releasing so the class state cannot be clobbered by a concurrent call.
+        Text-prompted YOLOE inference.
+        Holds the model for the full set_classes + inference cycle so class
+        state cannot be clobbered by a concurrent call.
         """
         model = await self._queue.get()
         try:
             await asyncio.to_thread(model.set_classes, classes)
-            results = await asyncio.to_thread(model, image, **kwargs)
-            return results
+            return await asyncio.to_thread(model, image, **kwargs)
+        finally:
+            await self._queue.put(model)
+
+    async def run_with_visual_prompts(
+        self,
+        current_image: np.ndarray,
+        refer_image:   np.ndarray,
+        bboxes:        np.ndarray,   # (N, 4) xyxy from past frame
+        cls_ids:       np.ndarray,   # (N,)   sequential ints starting at 0
+    ) -> list:
+        """
+        Visual-prompted YOLOE inference (SAVPE module).
+
+        refer_image + bboxes define what to look for — the model finds
+        visually similar objects in current_image.
+
+        cls_ids must be sequential starting from 0 (YOLOE requirement).
+        Map them back to human class names via past_class_map externally.
+        """
+        model = await self._queue.get()
+        try:
+            visual_prompts = {"bboxes": bboxes, "cls": cls_ids}
+
+            def _predict():
+                return model.predict(
+                    source=current_image,
+                    refer_image=refer_image,
+                    visual_prompts=visual_prompts,
+                    predictor=YOLOEVPSegPredictor,
+                    verbose=False,
+                )
+
+            return await asyncio.to_thread(_predict)
         finally:
             await self._queue.put(model)
 
     async def get_names(self) -> dict:
-        """Peek at model.names without disrupting the pool."""
         model = await self._queue.get()
         names = model.names
         await self._queue.put(model)
         return names
 
 
-# Pools initialised in main() before the message loop
+# Initialised in main()
 pool_seg:     ModelPool | None = None
 pool_pose:    ModelPool | None = None
-pool_ov:      ModelPool | None = None   # prompt-free, background detection
-pool_ov_text: ModelPool | None = None   # text-prompted, query-directed detection
+pool_ov:      ModelPool | None = None   # prompt-free background sweep
+pool_ov_text: ModelPool | None = None   # text + visual prompted
 
 
 # ---------- Spatial helpers ----------
 def _position_label(cx_norm: float) -> str:
-    if cx_norm < 0.33:
-        return "left"
-    elif cx_norm < 0.67:
-        return "center"
+    if cx_norm < 0.33:    return "left"
+    elif cx_norm < 0.67:  return "center"
     return "right"
 
-
 def _depth_label(area_norm: float) -> str:
-    if area_norm > 0.15:
-        return "foreground"
-    elif area_norm > 0.04:
-        return "midground"
+    if area_norm > 0.15:   return "foreground"
+    elif area_norm > 0.04: return "midground"
     return "background"
 
-
 def _confidence_label(conf: float) -> str:
-    if conf >= 0.70:
-        return "high"
-    elif conf >= 0.40:
-        return "mid"
+    if conf >= 0.70:   return "high"
+    elif conf >= 0.40: return "mid"
     return "low"
-
 
 def _bbox_to_spatial(bbox: list[float], img_w: int, img_h: int) -> tuple[str, str]:
     x1, y1, x2, y2 = bbox
@@ -225,61 +242,59 @@ def _bbox_to_spatial(bbox: list[float], img_w: int, img_h: int) -> tuple[str, st
 
 
 # ---------- Detection extractors ----------
-def extract_seg_detections(results, img_w: int, img_h: int, model_names: dict) -> list[dict]:
+def extract_seg_detections(results, img_w, img_h, model_names) -> list[dict]:
     dets = []
     for r in results:
         if r.boxes is None:
             continue
-        boxes   = r.boxes.xyxy.cpu().numpy().tolist()
-        confs   = r.boxes.conf.cpu().numpy().tolist()
-        classes = r.boxes.cls.cpu().numpy().tolist()
-        for i in range(len(boxes)):
-            conf = confs[i]
+        for bbox, conf, cls in zip(
+            r.boxes.xyxy.cpu().numpy().tolist(),
+            r.boxes.conf.cpu().numpy().tolist(),
+            r.boxes.cls.cpu().numpy().tolist(),
+        ):
             if conf < CONFIDENCE_THRESHOLD:
                 continue
-            pos, depth = _bbox_to_spatial(boxes[i], img_w, img_h)
+            pos, depth = _bbox_to_spatial(bbox, img_w, img_h)
             dets.append({
                 "source":     "seg",
-                "class":      model_names[int(classes[i])],
+                "class":      model_names[int(cls)],
                 "confidence": conf,
                 "conf_label": _confidence_label(conf),
                 "position":   pos,
                 "depth":      depth,
-                "bbox":       boxes[i],
+                "bbox":       bbox,
                 "pose":       None,
             })
     return dets
 
 
-def extract_pose_detections(results, img_w: int, img_h: int) -> list[dict]:
+def extract_pose_detections(results, img_w, img_h) -> list[dict]:
     dets = []
     for r in results:
         if r.boxes is None:
             continue
-        boxes     = r.boxes.xyxy.cpu().numpy().tolist()
-        confs     = r.boxes.conf.cpu().numpy().tolist()
-        classes   = r.boxes.cls.cpu().numpy().tolist()
         keypoints = r.keypoints
-        kp_data   = (
+        kp_data = (
             keypoints.data.cpu().numpy().tolist()
             if keypoints is not None
-            else [None] * len(boxes)
+            else [None] * len(r.boxes)
         )
-        for i in range(len(boxes)):
-            if int(classes[i]) != 0:  # persons only
-                continue
-            conf = confs[i]
-            if conf < CONFIDENCE_THRESHOLD:
+        for i, (bbox, conf, cls) in enumerate(zip(
+            r.boxes.xyxy.cpu().numpy().tolist(),
+            r.boxes.conf.cpu().numpy().tolist(),
+            r.boxes.cls.cpu().numpy().tolist(),
+        )):
+            if int(cls) != 0 or conf < CONFIDENCE_THRESHOLD:
                 continue
             kp = kp_data[i]
-            pose_data = (
+            pose_data  = (
                 [{"x": pt[0], "y": pt[1], "visibility": int(pt[2])} for pt in kp]
                 if kp else None
             )
             pose_state = _infer_pose_state(kp) if kp else "unknown"
-            pos, depth = _bbox_to_spatial(boxes[i], img_w, img_h)
+            pos, depth = _bbox_to_spatial(bbox, img_w, img_h)
             dets.append({
-                "bbox":       boxes[i],
+                "bbox":       bbox,
                 "confidence": conf,
                 "conf_label": _confidence_label(conf),
                 "position":   pos,
@@ -291,7 +306,13 @@ def extract_pose_detections(results, img_w: int, img_h: int) -> list[dict]:
 
 
 def _infer_pose_state(keypoints: list) -> str:
-    """Rough seated/standing heuristic from COCO keypoints."""
+    """
+    Seated/standing heuristic from COCO keypoints.
+
+    Requires nose, hips, AND ankles all visible above threshold before
+    committing to a label. Returns "partial" otherwise so unreliable pose
+    labels don't pollute the detection summary.
+    """
     try:
         nose    = keypoints[0]
         l_hip   = keypoints[11]
@@ -301,90 +322,118 @@ def _infer_pose_state(keypoints: list) -> str:
 
         visible = lambda kp: kp[2] > 0.3
 
-        hips_visible   = visible(l_hip) or visible(r_hip)
-        ankles_visible = visible(l_ankle) or visible(r_ankle)
-
-        if not hips_visible:
+        if not (
+            (visible(l_hip) or visible(r_hip)) and
+            (visible(l_ankle) or visible(r_ankle)) and
+            visible(nose)
+        ):
             return "partial"
 
         hip_y = (
             (l_hip[1] if visible(l_hip) else 0) +
             (r_hip[1] if visible(r_hip) else 0)
-        ) / max((1 if visible(l_hip) else 0) + (1 if visible(r_hip) else 0), 1)
+        ) / max(int(visible(l_hip)) + int(visible(r_hip)), 1)
 
-        nose_y = nose[1] if visible(nose) else 0
+        ankle_y = (
+            (l_ankle[1] if visible(l_ankle) else 0) +
+            (r_ankle[1] if visible(r_ankle) else 0)
+        ) / max(int(visible(l_ankle)) + int(visible(r_ankle)), 1)
 
-        if ankles_visible:
-            ankle_y = (
-                (l_ankle[1] if visible(l_ankle) else 0) +
-                (r_ankle[1] if visible(r_ankle) else 0)
-            ) / max(
-                (1 if visible(l_ankle) else 0) + (1 if visible(r_ankle) else 0), 1
-            )
-            if nose_y > 0 and ankle_y > hip_y:
-                torso_to_leg_ratio = (hip_y - nose_y) / max(ankle_y - hip_y, 1)
-                if torso_to_leg_ratio > 1.5:
-                    return "seated"
-                return "standing"
+        torso_to_leg = (hip_y - nose[1]) / max(ankle_y - hip_y, 1)
+        return "seated" if torso_to_leg > 1.5 else "standing"
 
-        return "seated"
     except (IndexError, ZeroDivisionError):
         return "unknown"
 
 
-def extract_ov_detections(results, img_w: int, img_h: int, model_names: dict) -> list[dict]:
+def extract_ov_detections(results, img_w, img_h, model_names) -> list[dict]:
     dets = []
     for r in results:
         if r.boxes is None:
             continue
-        boxes   = r.boxes.xyxy.cpu().numpy().tolist()
-        confs   = r.boxes.conf.cpu().numpy().tolist()
-        classes = r.boxes.cls.cpu().numpy().tolist()
-        for i in range(len(boxes)):
-            conf = confs[i]
+        for bbox, conf, cls in zip(
+            r.boxes.xyxy.cpu().numpy().tolist(),
+            r.boxes.conf.cpu().numpy().tolist(),
+            r.boxes.cls.cpu().numpy().tolist(),
+        ):
             if conf < CONFIDENCE_THRESHOLD:
                 continue
-            pos, depth = _bbox_to_spatial(boxes[i], img_w, img_h)
+            pos, depth = _bbox_to_spatial(bbox, img_w, img_h)
             dets.append({
                 "source":     "openvocab",
-                "class":      model_names[int(classes[i])],
+                "class":      model_names[int(cls)],
                 "confidence": conf,
                 "conf_label": _confidence_label(conf),
                 "position":   pos,
                 "depth":      depth,
-                "bbox":       boxes[i],
+                "bbox":       bbox,
                 "pose":       None,
             })
     return dets
 
 
-def extract_query_detections(results, img_w: int, img_h: int, model_names: dict) -> list[dict]:
+def extract_query_detections(results, img_w, img_h, model_names) -> list[dict]:
+    """Text-prompted detections. Tagged source='query' → [Q] in summary."""
+    dets = []
+    for r in results:
+        if r.boxes is None:
+            continue
+        for bbox, conf, cls in zip(
+            r.boxes.xyxy.cpu().numpy().tolist(),
+            r.boxes.conf.cpu().numpy().tolist(),
+            r.boxes.cls.cpu().numpy().tolist(),
+        ):
+            if conf < QUERY_CONFIDENCE_THRESHOLD:
+                continue
+            pos, depth = _bbox_to_spatial(bbox, img_w, img_h)
+            dets.append({
+                "source":     "query",
+                "class":      model_names[int(cls)],
+                "confidence": conf,
+                "conf_label": _confidence_label(conf),
+                "position":   pos,
+                "depth":      depth,
+                "bbox":       bbox,
+                "pose":       None,
+            })
+    return dets
+
+
+def extract_vp_detections(
+    results,
+    img_w: int,
+    img_h: int,
+    past_class_map: dict[int, str],
+) -> list[dict]:
     """
-    Extract detections from a query-directed YOLOE inference.
-    Marked source='query' so they appear first in the summary and are
-    clearly distinguished from background detections.
-    Uses a lower confidence threshold since classes are query-specific.
+    Visual-prompt detections. Tagged source='visual_prompt' → [VP] in summary.
+
+    past_class_map maps sequential cls_id (0, 1, 2...) back to the human-
+    readable class name from the past frame so the summary says
+    "[VP] pink blanket" rather than "[VP] 0".
     """
     dets = []
     for r in results:
         if r.boxes is None:
             continue
-        boxes   = r.boxes.xyxy.cpu().numpy().tolist()
-        confs   = r.boxes.conf.cpu().numpy().tolist()
-        classes = r.boxes.cls.cpu().numpy().tolist()
-        for i in range(len(boxes)):
-            conf = confs[i]
-            if conf < QUERY_CONFIDENCE_THRESHOLD:
+        for bbox, conf, cls in zip(
+            r.boxes.xyxy.cpu().numpy().tolist(),
+            r.boxes.conf.cpu().numpy().tolist(),
+            r.boxes.cls.cpu().numpy().tolist(),
+        ):
+            if conf < VP_CONFIDENCE_THRESHOLD:
                 continue
-            pos, depth = _bbox_to_spatial(boxes[i], img_w, img_h)
+            cls_id     = int(cls)
+            cls_name   = past_class_map.get(cls_id, f"object_{cls_id}")
+            pos, depth = _bbox_to_spatial(bbox, img_w, img_h)
             dets.append({
-                "source":     "query",
-                "class":      model_names[int(classes[i])],
+                "source":     "visual_prompt",
+                "class":      cls_name,
                 "confidence": conf,
                 "conf_label": _confidence_label(conf),
                 "position":   pos,
                 "depth":      depth,
-                "bbox":       boxes[i],
+                "bbox":       bbox,
                 "pose":       None,
             })
     return dets
@@ -392,39 +441,38 @@ def extract_query_detections(results, img_w: int, img_h: int, model_names: dict)
 
 # ---------- IoU ----------
 def iou(box1: list, box2: list) -> float:
-    x1 = max(box1[0], box2[0])
-    y1 = max(box1[1], box2[1])
-    x2 = min(box1[2], box2[2])
-    y2 = min(box1[3], box2[3])
+    x1 = max(box1[0], box2[0]); y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2]); y2 = min(box1[3], box2[3])
     inter = max(0, x2 - x1) * max(0, y2 - y1)
-    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
-    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
-    union = area1 + area2 - inter
+    a1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    a2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    union = a1 + a2 - inter
     return inter / union if union > 0 else 0.0
 
 
 # ---------- Merge ----------
 def merge_detections(
-    seg_dets: list[dict],
-    pose_dets: list[dict],
-    ov_dets: list[dict],
+    seg_dets:   list[dict],
+    pose_dets:  list[dict],
+    ov_dets:    list[dict],
     query_dets: list[dict],
+    vp_dets:    list[dict],
     iou_threshold: float = 0.5,
 ) -> list[dict]:
     """
-    1. Attach pose keypoints/state to matching seg person detections.
-    2. Append unmatched pose detections as standalone entries.
-    3. Append open-vocab detections.
-    4. Prepend query-directed detections — most relevant to the prompt.
+    Fuse pose onto matching seg person boxes, then order:
+      [VP] verified past objects first — concrete temporal evidence
+      [Q]  query-directed detections second
+      seg + ov background sweep last
     """
-    seg_person_indices = [i for i, d in enumerate(seg_dets) if d["class"] == "person"]
+    seg_person_idx = [i for i, d in enumerate(seg_dets) if d["class"] == "person"]
 
     for p in pose_dets:
         best_iou, best_idx = 0.0, -1
-        for idx in seg_person_indices:
-            val = iou(p["bbox"], seg_dets[idx]["bbox"])
-            if val > best_iou:
-                best_iou, best_idx = val, idx
+        for idx in seg_person_idx:
+            v = iou(p["bbox"], seg_dets[idx]["bbox"])
+            if v > best_iou:
+                best_iou, best_idx = v, idx
         if best_iou >= iou_threshold:
             seg_dets[best_idx]["pose"]       = p["keypoints"]
             seg_dets[best_idx]["pose_state"] = p.get("pose_state", "unknown")
@@ -441,22 +489,19 @@ def merge_detections(
                 "pose_state": p.get("pose_state", "unknown"),
             })
 
-    return query_dets + seg_dets + ov_dets
+    return vp_dets + query_dets + seg_dets + ov_dets
 
 
 # ---------- Summary builder ----------
-def build_detection_summary(detections: list[dict], query_concepts: list[str]) -> str:
+def build_detection_summary(
+    detections:    list[dict],
+    query_concepts: list[str],
+) -> str:
     """
-    Build an enriched detection summary string.
-
-    Query detections are listed first with [Q] prefix so the VLM knows
-    they were specifically sought. Low-confidence non-query detections
-    are filtered. Duplicate class names are deduplicated (query detections
-    always included regardless of duplication).
-
-    Example:
-      "[Q] pink item (center, foreground, mid), person (center, foreground, high, seated),
-       laptop (left, midground, high) | searched for: "pink item", "pink object", "pink""
+    [VP] verified past-object detections come first.
+    [Q]  query-directed detections come second.
+    Low-confidence background detections are filtered.
+    Class names are deduplicated for background detections only.
     """
     parts: list[str] = []
     seen_classes: set[str] = set()
@@ -469,13 +514,20 @@ def build_detection_summary(detections: list[dict], query_concepts: list[str]) -
         pos    = det.get("position", "")
         depth  = det.get("depth", "")
 
-        if source != "query" and conf_l == "low":
+        is_special = source in ("query", "visual_prompt")
+
+        if not is_special and conf_l == "low":
             continue
 
-        label = f"[Q] {cls}" if source == "query" else cls
+        if source == "visual_prompt":
+            label = f"[VP] {cls}"
+        elif source == "query":
+            label = f"[Q] {cls}"
+        else:
+            label = cls
 
         attrs = [pos, depth, conf_l]
-        if source != "query":
+        if not is_special:
             state = det.get("pose_state", "")
             if state and state not in ("unknown", "partial"):
                 attrs.append(state)
@@ -483,7 +535,7 @@ def build_detection_summary(detections: list[dict], query_concepts: list[str]) -
         part = f"{label} ({', '.join(a for a in attrs if a)})"
 
         key = cls.lower()
-        if source == "query":
+        if is_special:
             parts.append(part)
         elif key not in seen_classes:
             seen_classes.add(key)
@@ -498,48 +550,30 @@ def build_detection_summary(detections: list[dict], query_concepts: list[str]) -
     return summary
 
 
-# ---------- Redis / HTTP ----------
-r = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True)
-http_client = httpx.AsyncClient(timeout=30.0)
-
-
-async def ensure_consumer_group():
+# ---------- Image fetch ----------
+async def fetch_image(url: str) -> np.ndarray | None:
     try:
-        await r.xgroup_create(INPUT_STREAM, CONSUMER_GROUP, id="0", mkstream=True)
-    except ResponseError as e:
-        if "BUSYGROUP" not in str(e):
-            raise
-
-
-async def recover_pending_messages():
-    try:
-        pending = await r.xpending(INPUT_STREAM, CONSUMER_GROUP)
-        count   = pending.get("pending", 0)
-        if count == 0:
-            return
-        log.info(f"Found {count} pending messages — checking for stale entries")
-        claimed = await r.xautoclaim(
-            INPUT_STREAM, CONSUMER_GROUP, CONSUMER_NAME,
-            min_idle_time=MAX_PENDING_AGE, start_id="0-0", count=100,
-        )
-        messages = claimed[1] if isinstance(claimed, (list, tuple)) else []
-        for mid, fields in messages:
-            log.warning(f"Moving stale message {mid} to DLQ")
-            await r.xadd(DLQ_STREAM, {"original_id": mid, "data": fields.get("data", "")})
-            await r.xack(INPUT_STREAM, CONSUMER_GROUP, mid)
-        if messages:
-            log.info(f"Recovered {len(messages)} stale messages → DLQ")
+        resp = await http_client.get(url)
+        resp.raise_for_status()
+        return cv2.imdecode(np.frombuffer(resp.content, np.uint8), cv2.IMREAD_COLOR)
     except Exception as e:
-        log.warning(f"Pending recovery failed (non-fatal): {e}")
+        log.warning(f"fetch_image failed for {url}: {e}")
+        return None
 
 
-# ---------- Core processing ----------
-async def process_one_message(data: dict):
+# ---------- Job handlers ----------
+async def handle_capture_job(data: dict):
+    """
+    Background capture or user query capture.
+
+    Always runs: seg + pose + prompt-free OV.
+    Also runs:   text-prompted OV when a user prompt is present.
+    Publishes to stream:embed:input.
+    """
     filepath   = data.get("filepath")
     timestamp  = data.get("timestamp")
     request_id = data.get("id") or str(uuid.uuid4())
     prompt     = data.get("prompt", "")
-
     rlog = logging.LoggerAdapter(log, {"request_id": request_id})
 
     if not filepath or not timestamp:
@@ -549,17 +583,9 @@ async def process_one_message(data: dict):
     filename  = os.path.basename(filepath)
     image_url = f"{IMAGE_SERVER_URL}/{filename}"
 
-    try:
-        resp = await http_client.get(image_url)
-        resp.raise_for_status()
-        img_bytes = resp.content
-    except Exception as e:
-        rlog.error(f"Image download failed: {e}")
-        return
-
-    img_array = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+    img_array = await fetch_image(image_url)
     if img_array is None:
-        rlog.error(f"Failed to decode image: {image_url}")
+        rlog.error(f"Could not fetch image: {image_url}")
         return
 
     img_h, img_w = img_array.shape[:2]
@@ -567,90 +593,222 @@ async def process_one_message(data: dict):
     query_concepts: list[str] = []
     if prompt and prompt.strip():
         query_concepts = extract_visual_concepts(prompt)
-        rlog.info(
-            f"Extracted {len(query_concepts)} visual concepts: {query_concepts[:5]}"
-        )
+        rlog.info(f"Extracted {len(query_concepts)} concepts: {query_concepts[:5]}")
 
-    rlog.info(f"Running detection on {image_url} (prompt={'yes' if prompt else 'no'})")
+    rlog.info(f"Capture job: {filename} prompt={'yes' if prompt else 'no'}")
 
-    # Run seg, pose, and prompt-free OV concurrently.
-    # Query-directed run uses pool_ov_text (text-prompted variant) separately.
-    tasks = [
+    r_seg, r_pose, r_ov, r_query = await asyncio.gather(
         pool_seg.run(img_array),
         pool_pose.run(img_array),
         pool_ov.run(img_array),
-    ]
-    if query_concepts:
-        tasks.append(pool_ov_text.run_with_classes(img_array, query_concepts))
-    else:
-        tasks.append(asyncio.sleep(0))  # placeholder to keep index alignment
+        pool_ov_text.run_with_classes(img_array, query_concepts)
+        if query_concepts else asyncio.sleep(0),
+        return_exceptions=True,
+    )
 
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    results_seg, results_pose, results_ov, results_query = results
-
-    # --- seg ---
     seg_dets: list[dict] = []
-    if isinstance(results_seg, Exception):
-        rlog.error(f"Segmentation model failed: {results_seg}")
+    if isinstance(r_seg, Exception):
+        rlog.error(f"Seg failed: {r_seg}")
     else:
-        seg_names = await pool_seg.get_names()
-        seg_dets  = extract_seg_detections(results_seg, img_w, img_h, seg_names)
+        seg_dets = extract_seg_detections(r_seg, img_w, img_h, await pool_seg.get_names())
 
-    # --- pose ---
     pose_dets: list[dict] = []
-    if isinstance(results_pose, Exception):
-        rlog.error(f"Pose model failed: {results_pose}")
+    if isinstance(r_pose, Exception):
+        rlog.error(f"Pose failed: {r_pose}")
     else:
-        pose_dets = extract_pose_detections(results_pose, img_w, img_h)
+        pose_dets = extract_pose_detections(r_pose, img_w, img_h)
 
-    # --- prompt-free OV ---
     ov_dets: list[dict] = []
-    if isinstance(results_ov, Exception):
-        rlog.error(f"Open-vocab model failed: {results_ov}")
+    if isinstance(r_ov, Exception):
+        rlog.error(f"OV failed: {r_ov}")
     else:
-        ov_names = await pool_ov.get_names()
-        ov_dets  = extract_ov_detections(results_ov, img_w, img_h, ov_names)
+        ov_dets = extract_ov_detections(r_ov, img_w, img_h, await pool_ov.get_names())
 
-    # --- query-directed OV (text-prompted model) ---
     query_dets: list[dict] = []
     if query_concepts:
-        if isinstance(results_query, Exception):
-            rlog.error(f"Query-directed model failed: {results_query}")
+        if isinstance(r_query, Exception):
+            rlog.error(f"Query-directed failed: {r_query}")
         else:
-            # After run_with_classes the model's .names reflects the custom
-            # classes that were set for this run
-            q_names    = await pool_ov_text.get_names()
-            query_dets = extract_query_detections(results_query, img_w, img_h, q_names)
-            rlog.info(
-                f"Query detection: {len(query_dets)} matches "
-                f"for concepts {query_concepts[:3]}"
+            query_dets = extract_query_detections(
+                r_query, img_w, img_h, await pool_ov_text.get_names()
             )
+            rlog.info(f"Query detections: {len(query_dets)} for {query_concepts[:3]}")
 
-    all_dets = merge_detections(seg_dets, pose_dets, ov_dets, query_dets)
+    all_dets = merge_detections(seg_dets, pose_dets, ov_dets, query_dets, vp_dets=[])
     summary  = build_detection_summary(all_dets, query_concepts)
+    rlog.info(f"Summary: {summary[:120]}...")
 
-    rlog.info(f"Detection summary: {summary[:120]}...")
-
-    out_msg = {
+    await r.xadd(OUTPUT_STREAM, {"data": json.dumps({
         "id":                request_id,
         "filepath":          filepath,
         "timestamp":         timestamp,
         "prompt":            prompt,
         "detection_json":    json.dumps(all_dets),
         "detection_summary": summary,
-    }
-    await r.xadd(OUTPUT_STREAM, {"data": json.dumps(out_msg)})
-    rlog.info(f"Published enriched message for {filename}")
+    })})
+    rlog.info(f"→ embed ({filename})")
+
+
+async def handle_vp_job(data: dict):
+    """
+    Visual prompt verification job dispatched by embed for temporal queries.
+
+    Embed retrieves a relevant past frame and its stored detection bboxes,
+    then asks detector: are these objects still present in the current frame?
+
+    Message fields:
+        id                  — original request_id (for correlation)
+        current_image_url   — current frame to run inference on
+        past_image_url      — reference frame (bboxes originate here)
+        past_detection_json — JSON list of detection dicts from past frame
+        reply_to            — stream key for the result
+                              e.g. "stream:detector:reply:{request_id}"
+
+    Result published to reply_to:
+        id                    — request_id
+        vp_detection_json     — JSON list of VP detection dicts
+        vp_detection_summary  — summary string with [VP] prefixes
+        elapsed_ms            — wall time for this VP pass
+    """
+    request_id    = data.get("id", str(uuid.uuid4()))
+    current_url   = data.get("current_image_url")
+    past_url      = data.get("past_image_url")
+    past_det_json = data.get("past_detection_json", "[]")
+    reply_to      = data.get("reply_to")
+    rlog = logging.LoggerAdapter(log, {"request_id": request_id})
+
+    if not current_url or not past_url or not reply_to:
+        rlog.warning("VP job missing required fields — skipping")
+        return
+
+    t0 = asyncio.get_event_loop().time()
+
+    current_arr, past_arr = await asyncio.gather(
+        fetch_image(current_url),
+        fetch_image(past_url),
+        return_exceptions=True,
+    )
+
+    if isinstance(current_arr, Exception) or current_arr is None:
+        rlog.error(f"Could not fetch current image: {current_url}")
+        return
+    if isinstance(past_arr, Exception) or past_arr is None:
+        rlog.error(f"Could not fetch past image: {past_url}")
+        return
+
+    img_h, img_w = current_arr.shape[:2]
+
+    try:
+        past_dets = json.loads(past_det_json)
+    except Exception:
+        past_dets = []
+
+    # Pick high-confidence past detections, sorted by confidence desc
+    candidates = sorted(
+        [d for d in past_dets if d.get("confidence", 0) >= CONFIDENCE_THRESHOLD and d.get("class")],
+        key=lambda d: d["confidence"],
+        reverse=True,
+    )[:MAX_VP_BBOXES]
+
+    if not candidates:
+        rlog.info("No suitable bboxes from past frame — skipping VP job")
+        return
+
+    # Build sequential cls_ids (YOLOE requirement) and name lookup
+    past_class_map: dict[int, str] = {}
+    bboxes_list:    list[list]     = []
+    cls_ids_list:   list[int]      = []
+
+    for i, det in enumerate(candidates):
+        bboxes_list.append(det["bbox"])
+        cls_ids_list.append(i)
+        past_class_map[i] = det["class"]
+
+    bboxes  = np.array(bboxes_list,  dtype=np.float32)
+    cls_ids = np.array(cls_ids_list, dtype=np.int32)
+
+    rlog.info(
+        f"VP job: checking {len(candidates)} past objects "
+        f"{list(past_class_map.values())[:5]} in current frame"
+    )
+
+    try:
+        results = await pool_ov_text.run_with_visual_prompts(
+            current_image=current_arr,
+            refer_image=past_arr,
+            bboxes=bboxes,
+            cls_ids=cls_ids,
+        )
+    except Exception as e:
+        rlog.error(f"VP inference failed: {e}")
+        return
+
+    vp_dets  = extract_vp_detections(results, img_w, img_h, past_class_map)
+    vp_summary = build_detection_summary(vp_dets, [])
+    elapsed_ms = int((asyncio.get_event_loop().time() - t0) * 1000)
+
+    rlog.info(f"VP result: {len(vp_dets)} matches in {elapsed_ms}ms — {vp_summary[:80]}")
+
+    await r.xadd(reply_to, {"data": json.dumps({
+        "id":                   request_id,
+        "vp_detection_json":    json.dumps(vp_dets),
+        "vp_detection_summary": vp_summary,
+        "elapsed_ms":           elapsed_ms,
+    })})
+    # Auto-expire the per-request reply stream after 60s
+    await r.expire(reply_to, 60)
+    rlog.info(f"→ {reply_to}")
+
+
+# ---------- Redis / HTTP ----------
+r           = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True)
+http_client = httpx.AsyncClient(timeout=30.0)
+
+
+async def ensure_consumer_groups():
+    for stream in (CAPTURE_STREAM, VP_STREAM):
+        try:
+            await r.xgroup_create(stream, CONSUMER_GROUP, id="0", mkstream=True)
+        except ResponseError as e:
+            if "BUSYGROUP" not in str(e):
+                raise
+
+
+async def recover_pending_messages():
+    for stream in (CAPTURE_STREAM, VP_STREAM):
+        try:
+            pending = await r.xpending(stream, CONSUMER_GROUP)
+            count   = pending.get("pending", 0)
+            if count == 0:
+                continue
+            log.info(f"Stream {stream}: {count} pending — checking stale")
+            claimed = await r.xautoclaim(
+                stream, CONSUMER_GROUP, CONSUMER_NAME,
+                min_idle_time=MAX_PENDING_AGE, start_id="0-0", count=100,
+            )
+            messages = claimed[1] if isinstance(claimed, (list, tuple)) else []
+            for mid, fields in messages:
+                log.warning(f"Moving stale {mid} from {stream} to DLQ")
+                await r.xadd(DLQ_STREAM, {
+                    "original_id": mid,
+                    "stream":      stream,
+                    "data":        fields.get("data", ""),
+                })
+                await r.xack(stream, CONSUMER_GROUP, mid)
+            if messages:
+                log.info(f"Recovered {len(messages)} stale from {stream}")
+        except Exception as e:
+            log.warning(f"Pending recovery for {stream} failed (non-fatal): {e}")
 
 
 # ---------- Main ----------
 async def main():
     global pool_seg, pool_pose, pool_ov, pool_ov_text
 
-    pool_seg      = ModelPool(SEG_MODEL,      MODEL_POOL_SIZE)
-    pool_pose     = ModelPool(POSE_MODEL,     MODEL_POOL_SIZE)
-    pool_ov       = ModelPool(OV_MODEL,       MODEL_POOL_SIZE)
-    pool_ov_text  = ModelPool(OV_TEXT_MODEL,  MODEL_POOL_SIZE)
+    pool_seg     = ModelPool(SEG_MODEL,     MODEL_POOL_SIZE)
+    pool_pose    = ModelPool(POSE_MODEL,    MODEL_POOL_SIZE)
+    pool_ov      = ModelPool(OV_MODEL,      MODEL_POOL_SIZE)
+    pool_ov_text = ModelPool(OV_TEXT_MODEL, MODEL_POOL_SIZE)
 
     await asyncio.gather(
         pool_seg.init(),
@@ -659,39 +817,52 @@ async def main():
         pool_ov_text.init(),
     )
 
-    await ensure_consumer_group()
+    await ensure_consumer_groups()
     await recover_pending_messages()
-    log.info(f"Detector listening on '{INPUT_STREAM}' (consumer={CONSUMER_NAME})")
+    log.info(
+        f"Detector listening on '{CAPTURE_STREAM}' + '{VP_STREAM}' "
+        f"(consumer={CONSUMER_NAME})"
+    )
 
     while True:
         try:
+            # Single blocking read across both streams — VP jobs get fair
+            # scheduling alongside normal captures
             messages = await r.xreadgroup(
                 groupname=CONSUMER_GROUP,
                 consumername=CONSUMER_NAME,
-                streams={INPUT_STREAM: ">"},
+                streams={CAPTURE_STREAM: ">", VP_STREAM: ">"},
                 count=1,
                 block=2000,
             )
             if not messages:
                 continue
 
-            for stream, msg_list in messages:
+            for stream_name, msg_list in messages:
                 for msg_id, fields in msg_list:
-                    data = json.loads(fields["data"])
+                    data       = json.loads(fields["data"])
+                    request_id = data.get("id", "unknown")
+                    rlog       = logging.LoggerAdapter(log, {"request_id": request_id})
+
                     try:
-                        await process_one_message(data)
-                        await r.xack(INPUT_STREAM, CONSUMER_GROUP, msg_id)
+                        if stream_name == VP_STREAM:
+                            await handle_vp_job(data)
+                        else:
+                            await handle_capture_job(data)
+                        await r.xack(stream_name, CONSUMER_GROUP, msg_id)
+
                     except Exception as e:
-                        request_id = data.get("id", "unknown")
-                        rlog = logging.LoggerAdapter(log, {"request_id": request_id})
                         rlog.error(
-                            f"Processing failed, routing to DLQ: {e}", exc_info=True
+                            f"Job failed on {stream_name}, routing to DLQ: {e}",
+                            exc_info=True,
                         )
-                        await r.xadd(
-                            DLQ_STREAM,
-                            {"original_id": msg_id, "error": str(e), "data": fields["data"]},
-                        )
-                        await r.xack(INPUT_STREAM, CONSUMER_GROUP, msg_id)
+                        await r.xadd(DLQ_STREAM, {
+                            "original_id": msg_id,
+                            "stream":      stream_name,
+                            "error":       str(e),
+                            "data":        fields["data"],
+                        })
+                        await r.xack(stream_name, CONSUMER_GROUP, msg_id)
 
         except Exception as e:
             log.error(f"Outer loop error: {e}", exc_info=True)
